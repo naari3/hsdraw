@@ -1,130 +1,166 @@
 # `hsdraw` Python API (minimal reference)
 
 ABI3-py37 wheel — load via the Blender add-on vendor path described in
-`docs/notes/phase6.md`.  Surface mirrors the csx pipeline pieces an add-on
-needs to call:
+`docs/notes/phase6.md`.  Surface mirrors HSDLib `HSDRawFile` /
+`HSDRootNode` / `HSD_JOBJ` 1:1 so existing csx scripts can be ported
+straight into Python without bringing project-specific schemas (e.g.
+`scene.json` from mkgp2-patch) into this library.
 
-| csx                                  | Python                                |
-|--------------------------------------|---------------------------------------|
-| `hsd_export_for_blender.csx`         | `hsdraw.export_scene_json`            |
-| `hsd_import_from_blender.csx`        | `hsdraw.import_from_scene_json`       |
-| (any HSDLib `Save`)                  | `hsdraw.write_dat`                    |
-| `new HSDRawFile(bytes).Roots`        | `hsdraw.parse_dat(bytes).root_names()`|
+## API table — csx (HSDLib) ↔ Python
 
-## Functions
+| Python                                  | csx (HSDLib)                                              | 用途                |
+|-----------------------------------------|-----------------------------------------------------------|---------------------|
+| `hsdraw.parse_dat(bytes) -> Dat`        | `new HSDRawFile(bytes)`                                   | parse               |
+| `Dat.roots() -> list[Root]`             | `file.Roots`                                              | iterate aliases     |
+| `Dat.add_root(name, target)`            | `file.Roots.Add(new HSDRootNode { Name=…, Data=… })`      | alias add           |
+| `Dat.remove_root(name) -> bool`         | `file.Roots.RemoveAt(file.Roots.FindIndex(…))`            | alias remove        |
+| `Dat.rename_root(old, new) -> bool`     | `root.Name = new`                                         | alias rename        |
+| `Dat.repoint_root(name, target) -> bool`| `root.Data = newAccessor`                                 | alias repoint       |
+| `Dat.find_root_for(target) -> Root?`    | `file.Roots.FirstOrDefault(r => r.Data._s == s)`          | reverse lookup      |
+| `Dat.scene_data() -> Root?`             | `file.Roots["scene_data"]`                                | course scene root   |
+| `Dat.write(optimize=True, buffer_align=True) -> bytes` | `file.Save(stream)`                        | serialize           |
+| `Root.name` (getter)                    | `HSDRootNode.Name`                                        | name                |
+| `Root.data` -> `HsdStruct`              | `HSDRootNode.Data`                                        | the struct it points to |
+| `JObj.alloc() -> JObj`                  | `new HSD_JOBJ()` + `SX=SY=SZ=1f`                          | alloc joint         |
+| `JObj.from_struct(s) -> JObj`           | `(HSD_JOBJ) s`                                            | typed view          |
+| `JObj.child` / `.next`                  | `j.Child` / `j.Next`                                      | hierarchy walk      |
+| `JObj.set_child(j or None)`             | `j.Child = …`                                             | hierarchy edit      |
+| `JObj.set_next(j or None)`              | `j.Next = …`                                              | hierarchy edit      |
+| `JObj.flags` getter/setter (`u32`)      | `j.Flags` (JOBJ_FLAG)                                     | flag bits           |
+| `JObj.tx` … `.sz` getter/setter         | `j.TX` … `j.SZ`                                           | local TRS           |
+| `JObj.local_trs() -> tuple[9]`          | (none — convenience)                                      | snapshot            |
+| `JObj.set_local_trs(tx, ty, …, sz)`     | (none — convenience)                                      | bulk write          |
+| `JObj.as_struct() -> HsdStruct`         | `j._s`                                                    | drop the typed view |
+| `HsdStruct.byte_size()` / `.raw()`      | `_s.Length` / `_s.GetData()`                              | introspection       |
+| `__eq__` / `__hash__` on JObj/HsdStruct | `obj._s == other._s` / `RuntimeHelpers.GetHashCode(_s)`   | identity comparison |
 
-### `hsdraw.version() -> str`
+## Quick reference
 
-Crate version (matches `Cargo.toml`).  Useful for telemetry / pinning
-checks in the add-on.
+### Functions
 
-### `hsdraw.parse_dat(data: bytes) -> Dat`
+- `hsdraw.version() -> str`
+- `hsdraw.parse_dat(bytes) -> Dat`
+- `hsdraw.export_scene_json(bytes, source_dat="", tex_dir=None) -> str`
+  — kept for callers that just want the read-side JSON output (parity-
+  verified against csx `hsd_export_for_blender.csx`).
+- `hsdraw.write_dat(bytes, optimize=True, buffer_align=True) -> bytes`
+  — same as `Dat.write()` for callers that don't want to hold a `Dat`.
 
-Validates the .dat header + relocation table.  Returns a `Dat` handle
-exposing `.root_names() -> list[str]` and `.byte_size() -> int`.  The
-fuller object-graph API (walk JObj/DObj/MObj) is deferred — for now use
-`export_scene_json` for read access.
+### Mutation primitives
 
-### `hsdraw.export_scene_json(data, /, source_dat="", tex_dir=None) -> str`
+The mutation surface lives on three classes — `Dat`, `Root`, `JObj` —
+plus a thin `HsdStruct` for identity comparison.  Every Python handle
+shares the same `Rc` as the parent `Dat`, so editing a `JObj` you
+pulled out of `Dat.scene_data().data` mutates the live tree, and the
+next `Dat.write()` picks it up.
 
-Returns a JSON string identical to what `hsd_export_for_blender.csx`
-writes (parity-verified across 6 vanilla MKGP2 courses).  When
-`tex_dir` is provided, decoded PNGs are dumped alongside; otherwise
-only the JSON skeleton is produced.
+`Root` is read-only (think tuple-shaped record).  Mutate aliases via
+the parent `Dat` (`add_root`, `remove_root`, `rename_root`,
+`repoint_root`).
 
-### `hsdraw.write_dat(data, /, optimize=True, buffer_align=True) -> bytes`
+## End-to-end example: alias add + TRS edit + new joint reparent
 
-`parse → write` with HSDLib-compatible struct identity dedup + buffer
-hash dedup.  Used as a smoke test for the writer; the alias-root
-round-trip parity holds across the 9-file fixture in
-`docs/notes/phase5.md`.
-
-### `hsdraw.import_from_scene_json(base_dat, scene_json, /) -> (bytes, dict)`
-
-Drop-in replacement for invoking `hsd_import_from_blender.csx` from a
-Blender add-on.  Applies the same Pass 0–4 mutations:
-
-1. Walk base scene tree DFS (matches `hsd_export_for_blender.csx`'s
-   `EmitJoint` ordering, so `jobj_N` ids in the JSON line up).
-2. Allocate fresh 0x40-byte `HSD_JOBJ` for any JSON joint id absent
-   from the base.
-3. `joint_aliases` add / repoint / stale-prune against
-   `dat.roots`.  Errors out on blank names / unknown target ids.
-4. Per-joint TRS + JOBJ_FLAG sync.
-5. Joint hierarchy rewire (rebuild `Child` / `Next` chain to match
-   `joint.children[]`).
-6. `write_dat`-equivalent serialization.
-
-`scene_json` accepts either a `str` (typical
-`open(...).read()` pattern) or `bytes`.  The returned `dict` reports
-per-pass counts for asserting / logging:
-
-```
-{
-  "joints_walked": 16,
-  "new_joints":    0,
-  "aliases_added": 1,
-  "aliases_repointed": 0,
-  "aliases_removed":   0,
-  "trs_changed":   0,
-  "flags_changed": 0,
-  "hierarchy_rewired": 0,
-}
-```
-
-## Add-on integration snippet
-
-This is the minimum a Blender add-on operator needs to call when
-exporting an edited bundle back to a .dat — drop-in replacement for the
-`subprocess.run(['dotnet-script', 'hsd_import_from_blender.csx', ...])`
-path that `mkgp2-patch` currently uses.
+This is the full rewrite of csx `hsd_import_from_blender.csx` Pass 0–4
+expressed against the Python primitive surface.  An add-on can drive
+its own JSON schema interpretation in pure Python and call this for
+the actual mutation:
 
 ```python
-import hsdraw, json, pathlib
+import hsdraw
 
-def import_bundle_to_dat(base_dat_path: str,
-                        bundle_dir: str,
-                        out_dat_path: str) -> dict:
-    base = pathlib.Path(base_dat_path).read_bytes()
-    scene = (pathlib.Path(bundle_dir) / "scene.json").read_text()
-    out, stats = hsdraw.import_from_scene_json(base, scene)
-    pathlib.Path(out_dat_path).write_bytes(out)
-    return stats
+# ---- parse ----------------------------------------------------------
+raw  = open("base.dat", "rb").read()
+dat  = hsdraw.parse_dat(raw)
 
-# Export-time read-only path (replaces hsd_export_for_blender.csx):
-def export_bundle(dat_path: str, bundle_dir: str) -> dict:
-    raw = pathlib.Path(dat_path).read_bytes()
-    bundle = pathlib.Path(bundle_dir)
-    bundle.mkdir(parents=True, exist_ok=True)
-    js = hsdraw.export_scene_json(
-        raw,
-        source_dat=pathlib.Path(dat_path).name,
-        tex_dir=str(bundle / "tex"),
-    )
-    (bundle / "scene.json").write_text(js)
-    return json.loads(js)
+# ---- DFS walk to assign jobj_N IDs (csx Pass 0 in Python) -----------
+def walk_joints(scene_root):
+    """Returns a {jobj_id: JObj} dict in the same DFS order csx uses."""
+    out, seen, counter = {}, set(), [0]
+    def visit(j):
+        key = hash(j)            # JObj.__hash__ is Rc-identity
+        if key in seen: return
+        seen.add(key)
+        jid = f"jobj_{counter[0]}"; counter[0] += 1
+        out[jid] = j
+        c = j.child
+        while c is not None:
+            visit(c); c = c.next
+    # Walk via the SOBJ accessor — for now we only have the JObj typed
+    # view, so SOBJ traversal is an add-on-side helper that knows the
+    # JOBJDescs[] layout.  Sketch:
+    #   sobj_struct = scene_root.data         # HsdStruct
+    #   ... add-on parses the JOBJDescs[] array out of sobj_struct ...
+    return out
+
+# ---- alias add (csx Pass 2) -----------------------------------------
+joints = walk_joints(dat.scene_data())
+dat.add_root("MR_highway_inu_joint", joints["jobj_3"])
+
+# ---- TRS edit (csx Pass 3) ------------------------------------------
+joints["jobj_2"].tx = 123.5
+joints["jobj_2"].set_local_trs(123.5, 0.0, 0.0,
+                               0.0,   0.0, 0.25,
+                               2.5,   1.0, 1.0)
+
+# ---- alloc + reparent (csx Phase 1.x — orphan / aliased / spliced) --
+new_joint = hsdraw.JObj.alloc()
+new_joint.tx = 42.0
+# (a) orphan: just leave it in a local — writer GCs it on save.
+# (b) aliased: register as a top-level alias root.
+dat.add_root("MR_highway_new_joint", new_joint)
+# (c) hierarchy-spliced: prepend as parent.Child[0].
+parent = joints["jobj_1"]
+old_first = parent.child
+new_joint.set_next(old_first)
+parent.set_child(new_joint)
+
+# ---- save (csx final step) ------------------------------------------
+open("out.dat", "wb").write(dat.write())
 ```
 
-## Errors
+The DFS walker is intentionally add-on-side: it depends on the
+project's id-naming convention (`jobj_N`) which is `mkgp2-patch`'s
+schema, not HSDLib's.
+
+### Errors
 
 `PyValueError` is raised on:
 
 - malformed .dat (header / relocation table inconsistencies)
-- unknown `JOBJ_FLAG` name in `scene.json` (typo, schema drift)
-- alias with empty name or unknown target id
-- hierarchy `joint.children[]` referencing an unknown joint id
+- TRS / flag setter on a struct shorter than 0x40 bytes (the JObj
+  setters auto-grow, but a primitive HsdStruct read OOB still errors)
 
-In every case the Rust-side error message is included; the add-on can
-surface it as `self.report({'ERROR'}, str(exc))` without further
-processing.
+`PyTypeError`:
 
-## Limitations (Phase 1 MVP — match csx)
+- `Dat.add_root` / `repoint_root` given anything that isn't a `JObj`
+  or `HsdStruct`.
 
-- Mesh / DObj / texture content is **not** edited.  The base .dat
-  provides them; the importer only edits joint hierarchy, alias roots,
-  TRS, and flags.  See `docs/roadmap.md` for the POBJ writer plan that
-  would lift this.
-- The `hsdraw.Dat` handle is a probe (root names + byte size); the
-  full accessor surface (walk JObj/DObj/MObj, mutate accessors, …) is
-  reserved for Phase 7+.  Use `export_scene_json` if you just need read
-  access to the structural metadata.
+## Limitations (deliberate non-goals)
+
+This binding is the HSDLib surface, not the Blender add-on surface.
+The following stay out of `hsdraw` core:
+
+- **`scene.json` schema** — that's `mkgp2-patch`'s convention and
+  belongs in the add-on.  The add-on builds its `jobj_id → JObj` map,
+  iterates the JSON, and calls the primitives above.
+- **Material / DObj / TObj typed views** — JObj is enough for csx Pass
+  0–4.  Other accessors land in `hsdraw_core` first (already there for
+  read-only walk) and get expose to Python when an actual writer use
+  case shows up.
+- **POBJ writer** (Blender mesh → fresh display list) — see
+  `docs/roadmap.md`.
+
+## Identity contract
+
+`JObj` and `HsdStruct` define `__eq__` / `__hash__` as Rc-identity:
+
+```python
+a = jobj_via_path_1
+b = jobj_via_path_2
+if a == b:
+    # they wrap the same underlying HsdStruct (alias!)
+```
+
+Use this instead of relying on `is` (which compares Python wrapper
+objects, not underlying struct identity — two PyJObj instances created
+from the same StructRef compare `is`-False but `==`-True).

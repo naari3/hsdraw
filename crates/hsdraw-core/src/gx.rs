@@ -417,30 +417,11 @@ pub fn render_flag_names(flags: MaterialRenderMode) -> Vec<&'static str> {
 /// EFFECTOR and BILLBOARD/V/H/R, and finally outputs the matched names in
 /// ascending numeric order.
 pub fn jobj_flag_names(flags: JObjFlag) -> Vec<&'static str> {
-    flag_names_for(flags.bits(), JOBJ_FLAG_NAMES, Some("NULL"))
-}
-
-/// Reverse of `jobj_flag_names`: parse a name string (e.g. `"OPA"`,
-/// `"EFFECTOR"`, `"NULL"`) into the matching `JObjFlag` bit pattern.
-/// Mirrors C# `Enum.TryParse<JOBJ_FLAG>(name, out var v)`: composite
-/// names (e.g. `EFFECTOR = 3<<21`) parse to their full bitmask, not to a
-/// single-bit subset.  Returns `None` for unknown names; `"NULL"` (and
-/// the empty string) parse to `0` to mirror C#'s named-0 round-trip.
-pub fn jobj_flag_from_name(name: &str) -> Option<JObjFlag> {
-    if name.is_empty() || name == "NULL" {
-        return Some(JObjFlag::from_bits_retain(0));
-    }
-    JOBJ_FLAG_NAMES
-        .iter()
-        .find(|(_, n)| *n == name)
-        .map(|(bits, _)| JObjFlag::from_bits_retain(*bits))
-}
-
-/// Single source of truth for the JObj flag-name table.  Sorted
-/// DESCENDING by mask so the greedy `flag_names_for` decomposition
-/// matches composites first; the reverse-lookup is name-keyed so order
-/// is irrelevant for it.
-const JOBJ_FLAG_NAMES: &[(u32, &str)] = &[
+    let bits = flags.bits();
+    // (mask, name), sorted DESCENDING for greedy-match.  Composites
+    // (EFFECTOR=3<<21, HBILLBOARD=3<<9, etc.) come before the single-bit
+    // entries that they would otherwise mask.
+    let table: &[(u32, &str)] = &[
         (1 << 30, "ROOT_TEXEDGE"),
         (1 << 29, "ROOT_XLU"),
         (1 << 28, "ROOT_OPA"),
@@ -473,6 +454,8 @@ const JOBJ_FLAG_NAMES: &[(u32, &str)] = &[
         (1 << 1, "SKELETON_ROOT"),
         (1 << 0, "SKELETON"),
     ];
+    flag_names_for(bits, table, Some("NULL"))
+}
 
 /// Greedy-match against `table` (entries sorted DESCENDING), then reverse
 /// the result so the output is in ascending numeric value — exactly the

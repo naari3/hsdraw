@@ -49,6 +49,66 @@ impl Dat {
     pub fn scene_data(&self) -> Option<&RootNode> {
         self.root("scene_data")
     }
+
+    // ------------------------------------------------------------------
+    // HSDLib-equivalent root mutation helpers.  These mirror what
+    // HSDRawFile exposes via List<HSDRootNode> + Add/RemoveAt: name
+    // lookup is by string equality, identity match is by `Rc::ptr_eq`.
+    // The Python binding wraps these directly; pure-Rust callers can
+    // also use them to drive structural edits without reaching into
+    // `dat.roots` mutably and risking aliasing bugs.
+    // ------------------------------------------------------------------
+
+    /// Append a new root pointing at `data`.  HSDLib equivalent:
+    /// `file.Roots.Add(new HSDRootNode { Name = name, Data = accessor })`.
+    pub fn add_root(&mut self, name: impl Into<String>, data: StructRef) {
+        self.roots.push(RootNode { name: name.into(), data });
+    }
+
+    /// Remove the first root whose name equals `name`.  Returns whether
+    /// anything was removed.  Matches `file.Roots.RemoveAt(i)` after a
+    /// `FindIndex`.
+    pub fn remove_root(&mut self, name: &str) -> bool {
+        if let Some(i) = self.roots.iter().position(|r| r.name == name) {
+            self.roots.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Rename the first root matching `old`.  Returns whether anything
+    /// was renamed.  HSDLib: `root.Name = new`.
+    pub fn rename_root(&mut self, old: &str, new: impl Into<String>) -> bool {
+        if let Some(r) = self.roots.iter_mut().find(|r| r.name == old) {
+            r.name = new.into();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Repoint the first root matching `name` to a different struct.
+    /// HSDLib: `root.Data = newAccessor`.  Returns false if no such
+    /// root exists.
+    pub fn repoint_root(&mut self, name: &str, target: StructRef) -> bool {
+        if let Some(r) = self.roots.iter_mut().find(|r| r.name == name) {
+            r.data = target;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// First root whose `data` is `Rc::ptr_eq(target)`.  HSDLib:
+    /// `file.Roots.FirstOrDefault(r => r.Data._s == s)`.  Useful for
+    /// "given this struct, what alias points at it?" lookups during
+    /// repoint passes.
+    pub fn find_root_for(&self, target: &StructRef) -> Option<&RootNode> {
+        self.roots
+            .iter()
+            .find(|r| Rc::ptr_eq(&r.data, target))
+    }
 }
 
 // =====================================================================

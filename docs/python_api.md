@@ -26,12 +26,32 @@ straight into Python without bringing project-specific schemas (e.g.
 | `JObj.child` / `.next`                  | `j.Child` / `j.Next`                                      | hierarchy walk      |
 | `JObj.set_child(j or None)`             | `j.Child = …`                                             | hierarchy edit      |
 | `JObj.set_next(j or None)`              | `j.Next = …`                                              | hierarchy edit      |
+| `JObj.set_dobj(d or None)`              | `j.Dobj = …`                                              | attach geometry/material |
 | `JObj.flags` getter/setter (`u32`)      | `j.Flags` (JOBJ_FLAG)                                     | flag bits           |
 | `JObj.tx` … `.sz` getter/setter         | `j.TX` … `j.SZ`                                           | local TRS           |
 | `JObj.local_trs() -> tuple[9]`          | (none — convenience)                                      | snapshot            |
 | `JObj.set_local_trs(tx, ty, …, sz)`     | (none — convenience)                                      | bulk write          |
 | `JObj.as_struct() -> HsdStruct`         | `j._s`                                                    | drop the typed view |
+| `DObj.alloc()`                          | `new HSD_DOBJ()`                                          | alloc material/mesh shell |
+| `DObj.set_mobj(s or None)`              | `d.Mobj = …`                                              | material attach     |
+| `DObj.set_pobj(p or None)`              | `d.Pobj = …`                                              | POBJ attach         |
+| `DObj.set_next(d or None)`              | `d.Next = …`                                              | DObj chain          |
+| `MeshBuilder()` + `.add_*` + `.build()` | `POBJ_Generator.CreatePOBJsFromTriangleList(…)`           | POBJ write          |
+| `MeshBuilder.set_use_triangle_strips(b)` | `POBJ_Generator.UseTriangleStrips = b`                   | toggle Phase 2 opt  |
+| `MeshBuilder.add_envelope([(JObj, w)])` | `HSD_Envelope.Add(jobj, weight)`                          | Phase 3 skinning    |
+| `MeshBuilder.add_envelope_index(idx)`   | `GX_Vertex.PNMTXIDX`                                      | Phase 3 per-vertex bone slot |
+| `Pobj.flags` / `.display_list_size`     | `p.Flags` / `p.DisplayListSize`                           | POBJ inspection     |
+| `Pobj.set_next(p or None)`              | `p.Next = …`                                              | POBJ chain          |
+| `MObj.alloc()` / `MObj.alloc_unlit_color(r,g,b,a)` | `new HSD_MOBJ()` / unlit preset                | material shell      |
+| `MObj.set_material(m or None)`          | `m.Material = …`                                          | attach Material     |
+| `MObj.set_pe_desc(p or None)`           | `m.PEDesc = …`                                            | pixel-process desc  |
+| `MObj.set_textures(s or None)`          | `m.Textures = …`                                          | TObj chain attach   |
+| `MObj.render_flags` getter/setter       | `m.RenderFlags` (RENDER_MODE)                             | flag bits           |
+| `Material.alloc()` + `.{amb,dif,spc}_rgba` + `.alpha` + `.shininess` | `new HSD_Material { … }`              | material colors     |
+| `PeDesc.alloc()` + per-byte setters     | `new HSD_PEDesc { BlendMode=…, … }`                      | PE descriptor       |
 | `HsdStruct.byte_size()` / `.raw()`      | `_s.Length` / `_s.GetData()`                              | introspection       |
+| `HsdStruct.references() -> [(off, target)]` | `_s.References`                                       | walk raw refs       |
+| `HsdStruct.get_reference(offset)`       | `_s.GetReference<HSDAccessor>(offset)` (sans typed cast)  | offset lookup       |
 | `__eq__` / `__hash__` on JObj/HsdStruct | `obj._s == other._s` / `RuntimeHelpers.GetHashCode(_s)`   | identity comparison |
 
 ## Quick reference
@@ -129,11 +149,112 @@ schema, not HSDLib's.
 - malformed .dat (header / relocation table inconsistencies)
 - TRS / flag setter on a struct shorter than 0x40 bytes (the JObj
   setters auto-grow, but a primitive HsdStruct read OOB still errors)
+- `MeshBuilder.build()` called with mismatched attribute counts,
+  out-of-range triangle indices, > 65,535 vertices, or no triangles
 
 `PyTypeError`:
 
 - `Dat.add_root` / `repoint_root` given anything that isn't a `JObj`
   or `HsdStruct`.
+
+## End-to-end example: brand-new mesh → JObj attach → save (Phase 1)
+
+For a Blender add-on building a fresh mesh from `bpy.data` (e.g. a UV-
+mapped racetrack stub) and writing it back into an MKGP2 course .dat:
+
+```python
+import hsdraw
+
+dat = hsdraw.parse_dat(open("base.dat", "rb").read())
+
+# ---- 1. build the POBJ from CPU-side mesh data --------------------
+mesh = hsdraw.MeshBuilder()
+
+# 3 verts, 1 triangle.  Push positions / normals / colors / UVs
+# (each optional except positions); their counts must match.
+mesh.add_position(0.0, 0.0, 0.0)
+mesh.add_position(1.0, 0.0, 0.0)
+mesh.add_position(0.0, 1.0, 0.0)
+mesh.add_normal(0.0, 0.0, 1.0)
+mesh.add_normal(0.0, 0.0, 1.0)
+mesh.add_normal(0.0, 0.0, 1.0)
+mesh.add_color(0xFF, 0x00, 0x00, 0xFF)   # red, full alpha
+mesh.add_color(0xFF, 0x00, 0x00, 0xFF)
+mesh.add_color(0xFF, 0x00, 0x00, 0xFF)
+mesh.add_triangle(0, 1, 2)
+mesh.set_cull_back(True)                  # POBJ_FLAG.CULLBACK
+pobj = mesh.build()                       # -> hsdraw.Pobj
+
+# ---- 2. shell DObj (material attach is up to the caller) ----------
+dobj = hsdraw.DObj.alloc()
+dobj.set_pobj(pobj)
+# dobj.set_mobj(my_mobj_struct)  # Phase 1 doesn't ship a MObj builder;
+                                  # reuse one pulled out of an existing
+                                  # course .dat or supply a raw HsdStruct.
+
+# ---- 3. attach to a JObj and add as a top-level alias root --------
+new_joint = hsdraw.JObj.alloc()
+new_joint.set_dobj(dobj)
+dat.add_root("MR_highway_my_mesh_joint", new_joint)
+
+# ---- 4. save ------------------------------------------------------
+open("out.dat", "wb").write(dat.write())
+```
+
+### POBJ writer capabilities (Phase 1–3)
+
+- **Phase 1 — TRIANGLES**: minimum-friction emit path.  `0x90`
+  primitive + GX_INDEX16 indices + fixed F32×3 / RGBA8 / F32×2 attrs.
+- **Phase 2 — TRIANGLE_STRIP optimization (default on)**: greedy
+  stripper produces `0x98 (TriangleStrip)` groups for chains of ≥ 4
+  verts plus a trailing `Triangles` group for the leftover.  Toggle
+  with `mb.set_use_triangle_strips(False)` if you want the predictable
+  Phase 1 byte layout (e.g. for diff-against-HSDLib).
+- **Phase 3 — envelope rigging**: per-vertex `add_envelope_index(i)`
+  references envelopes added via `add_envelope([(jobj, weight), …])`.
+  Sets `POBJ_FLAG.ENVELOPE`, emits `GX_VA_PNMTXIDX` direct attribute.
+  Up to 85 envelopes per POBJ (matrix-slot range); split above that.
+
+### Limits
+
+- ≤ 65,535 verts per `MeshBuilder` (one POBJ).  Larger meshes split
+  add-on-side into multiple POBJs.
+- Fixed attribute formats: POS F32×3, NRM F32×3, CLR0 RGBA8, TEX0 F32×2.
+  Multi-format / quantized buffers (I8 / S8 positions, etc.) are
+  deferred — see `docs/roadmap.md`.
+- The stripper is greedy, not vertex-cache-aware; HSDLib's
+  `TriangleConverter` produces a tighter encoding on large meshes.
+- One material / POBJ per attach point — multi-DObj DObj chains and
+  multi-MObj LOD selection are caller-side.
+
+## Skinned mesh example (Phase 3)
+
+```python
+import hsdraw
+
+dat = hsdraw.parse_dat(open("base.dat", "rb").read())
+
+# Locate two bones in the existing tree (caller-side schema parsing).
+joints = ...                       # {"bone_arm": JObj, "bone_hand": JObj}
+bone_arm  = joints["bone_arm"]
+bone_hand = joints["bone_hand"]
+
+mesh = hsdraw.MeshBuilder()
+# 4 verts: 2 bound to arm, 2 split 50/50 arm + hand
+mesh.add_position(0.0, 0.0, 0.0); mesh.add_position(1.0, 0.0, 0.0)
+mesh.add_position(0.0, 1.0, 0.0); mesh.add_position(1.0, 1.0, 0.0)
+env_arm  = mesh.add_envelope([(bone_arm, 1.0)])
+env_blend = mesh.add_envelope([(bone_arm, 0.5), (bone_hand, 0.5)])
+mesh.add_envelope_index(env_arm)
+mesh.add_envelope_index(env_arm)
+mesh.add_envelope_index(env_blend)
+mesh.add_envelope_index(env_blend)
+mesh.add_triangle(0, 1, 2)
+mesh.add_triangle(1, 3, 2)
+pobj = mesh.build()
+
+# Wire as before via DObj / JObj attach.
+```
 
 ## Limitations (deliberate non-goals)
 

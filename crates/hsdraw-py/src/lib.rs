@@ -18,10 +18,14 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use hsdraw_core::accessor::Accessor;
-use hsdraw_core::common::JObj as CoreJObj;
+use hsdraw_core::common::{
+    DObj as CoreDObj, JObj as CoreJObj, MObj as CoreMObj, Material as CoreMaterial,
+    PObj as CorePObj, PeDesc as CorePeDesc,
+};
 use hsdraw_core::dat::RootNode;
-use hsdraw_core::gx::JObjFlag;
+use hsdraw_core::gx::{JObjFlag, MaterialRenderMode};
 use hsdraw_core::hsd_struct::{StructRef, ptr_eq};
+use hsdraw_core::pobj_writer::MeshBuilder as CoreMeshBuilder;
 use hsdraw_core::{export, Dat as CoreDat};
 use pyo3::exceptions::{PyIOError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -219,6 +223,30 @@ impl PyHsdStruct {
         PyBytes::new(py, s.data())
     }
 
+    /// `(offset, target)` pairs for every reference this struct holds,
+    /// in ascending offset order.  Mirrors HSDLib `HSDStruct.References`
+    /// — needed by callers that have to walk typed sub-structs (e.g.
+    /// `HSD_SOBJ.JOBJDescs[]`) without a typed accessor for each layout.
+    fn references(&self) -> Vec<(u32, PyHsdStruct)> {
+        self.inner
+            .borrow()
+            .references()
+            .iter()
+            .map(|(off, target)| (*off, PyHsdStruct { inner: target.clone() }))
+            .collect()
+    }
+
+    /// Reference at `offset`, or `None` if no reference is set there.
+    /// Mirrors HSDLib `HSDStruct.GetReference<T>(offset)` (without the
+    /// typed cast — wrap the result in `JObj.from_struct` etc. on the
+    /// Python side if you want a typed view).
+    fn get_reference(&self, offset: u32) -> Option<PyHsdStruct> {
+        self.inner
+            .borrow()
+            .get_reference(offset)
+            .map(|s| PyHsdStruct { inner: s })
+    }
+
     /// True iff `self` and `other` share the same underlying Rc.  Same
     /// semantics as `is` in Python — exposed explicitly because PyO3
     /// classes default `__eq__` to value equality on string repr,
@@ -314,6 +342,17 @@ impl PyJObj {
     #[pyo3(signature = (next=None))]
     fn set_next(&self, next: Option<&PyJObj>) {
         self.view().set_next(next.map(|n| n.view()));
+    }
+
+    /// Attach (or detach) a DObj at offset 0x10.  Mirrors HSDLib
+    /// `j.Dobj = …`: clears `SPLINE` / `PTCL` flags so the 0x10 union
+    /// slot is interpreted as a DObj on the next read.  Pass `None` to
+    /// detach.
+    #[pyo3(signature = (dobj=None))]
+    fn set_dobj(&self, dobj: Option<&PyDObj>) -> PyResult<()> {
+        self.view()
+            .set_dobj(dobj.map(|d| CoreDObj::from_struct(d.inner.clone())))
+            .map_err(map_err)
     }
 
     // ----- Flags --------------------------------------------------
@@ -415,6 +454,632 @@ impl PyJObj {
 }
 
 // =====================================================================
+// DObj typed view  (HSDLib HSD_DOBJ accessor)
+// =====================================================================
+
+/// Typed view onto a 0x10-byte HSD_DOBJ struct.  Used as the bridge
+/// between a JObj and its render data: a DObj owns one MObj (material)
+/// and one POBJ (geometry), plus a Next pointer for chaining multiple
+/// DObjs off the same JObj.  Construct via `DObj.alloc()`, then
+/// `set_mobj` / `set_pobj` and finally `JObj.set_dobj`.
+#[pyclass(name = "DObj", module = "hsdraw", unsendable)]
+struct PyDObj {
+    inner: StructRef,
+}
+
+#[pymethods]
+impl PyDObj {
+    /// Allocate a fresh 0x10-byte HSD_DOBJ.  All fields zero (no
+    /// MObj / POBJ / Next yet — set them via the methods below).
+    #[staticmethod]
+    fn alloc() -> Self {
+        Self { inner: CoreDObj::allocate_default().0 }
+    }
+
+    /// Wrap an existing struct as a DObj typed view.  No bytes are
+    /// allocated; the view shares the struct's Rc.
+    #[staticmethod]
+    fn from_struct(s: &PyHsdStruct) -> Self {
+        Self { inner: s.inner.clone() }
+    }
+
+    fn as_struct(&self) -> PyHsdStruct {
+        PyHsdStruct { inner: self.inner.clone() }
+    }
+
+    /// Next sibling DObj in the parent JObj's chain, or `None`.
+    #[getter]
+    fn next(&self) -> Option<PyDObj> {
+        CoreDObj::from_struct(self.inner.clone())
+            .next()
+            .map(|n| PyDObj { inner: n.0 })
+    }
+
+    /// MObj (material) reference at offset 0x08, or `None` if not set.
+    /// Returned as a `HsdStruct` since this binding doesn't carry a
+    /// typed MObj wrapper yet (material construction is left to the
+    /// caller — see `docs/python_api.md` § Limitations).
+    #[getter]
+    fn mobj(&self) -> Option<PyHsdStruct> {
+        self.inner
+            .borrow()
+            .get_reference(0x08)
+            .map(|s| PyHsdStruct { inner: s })
+    }
+
+    /// POBJ reference at offset 0x0C, or `None`.
+    #[getter]
+    fn pobj(&self) -> Option<PyPObj> {
+        self.inner
+            .borrow()
+            .get_reference(0x0C)
+            .map(|s| PyPObj { inner: s })
+    }
+
+    /// Attach the next DObj in the chain.  Pass `None` to detach.
+    #[pyo3(signature = (next=None))]
+    fn set_next(&self, next: Option<&PyDObj>) {
+        CoreDObj::from_struct(self.inner.clone())
+            .set_next(next.map(|n| CoreDObj::from_struct(n.inner.clone())));
+    }
+
+    /// Attach a material.  Accepts either a `MObj` typed view (built
+    /// via `MObj.alloc()` / `MObj.alloc_unlit_color(...)`) or a raw
+    /// `HsdStruct` — caller's choice depending on whether they're
+    /// constructing a fresh material or reusing one pulled out of an
+    /// existing course .dat.  Pass `None` to detach.
+    #[pyo3(signature = (mobj=None))]
+    fn set_mobj(&self, mobj: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let target = match mobj {
+            Some(b) => Some(struct_ref_from_any(b)?),
+            None => None,
+        };
+        self.inner.borrow_mut().set_reference(0x08, target);
+        Ok(())
+    }
+
+    /// Attach a POBJ.  Accepts a `Pobj` typed view.  Pass `None` to
+    /// detach.
+    #[pyo3(signature = (pobj=None))]
+    fn set_pobj(&self, pobj: Option<&PyPObj>) {
+        CoreDObj::from_struct(self.inner.clone()).set_pobj(
+            pobj.map(|p| CorePObj::from_struct(p.inner.clone())),
+        );
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn __hash__(&self) -> isize {
+        Rc::as_ptr(&self.inner) as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hsdraw.DObj addr=0x{:X}>",
+            Rc::as_ptr(&self.inner) as usize
+        )
+    }
+}
+
+// =====================================================================
+// Pobj typed view  (HSDLib HSD_POBJ accessor)
+// =====================================================================
+
+/// Typed view onto a 0x18-byte HSD_POBJ struct.  Returned by
+/// `MeshBuilder.build()`.  Phase 1 only exposes inspection getters and
+/// the `Next` chain setter; the writer side (mesh data → POBJ) lives
+/// behind `MeshBuilder` so the byte-layout details (attribute table /
+/// DL bytecode / per-attribute buffer alignment) stay in one place.
+#[pyclass(name = "Pobj", module = "hsdraw", unsendable)]
+struct PyPObj {
+    inner: StructRef,
+}
+
+#[pymethods]
+impl PyPObj {
+    /// Wrap an existing struct as a Pobj typed view.
+    #[staticmethod]
+    fn from_struct(s: &PyHsdStruct) -> Self {
+        Self { inner: s.inner.clone() }
+    }
+
+    fn as_struct(&self) -> PyHsdStruct {
+        PyHsdStruct { inner: self.inner.clone() }
+    }
+
+    /// Next POBJ in the chain, or `None`.
+    #[getter]
+    fn next(&self) -> Option<PyPObj> {
+        self.inner
+            .borrow()
+            .get_reference(0x04)
+            .map(|s| PyPObj { inner: s })
+    }
+
+    /// Attach the next POBJ.  Pass `None` to detach.
+    #[pyo3(signature = (next=None))]
+    fn set_next(&self, next: Option<&PyPObj>) {
+        let mut s = self.inner.borrow_mut();
+        s.set_reference(0x04, next.map(|n| n.inner.clone()));
+    }
+
+    /// `POBJ_FLAG` bits as `u16`.  CULLBACK = (1<<14), CULLFRONT = (1<<15)
+    /// — the same bit positions HSDLib's `POBJ_FLAG` uses.
+    #[getter]
+    fn flags(&self) -> PyResult<u16> {
+        self.inner.borrow().get_u16(0x0C).map_err(map_err)
+    }
+
+    /// DL bytecode size in bytes (computed: stored as `bytes/32`).
+    #[getter]
+    fn display_list_size(&self) -> PyResult<u32> {
+        Ok(self.inner.borrow().get_i16(0x0E).map_err(map_err)? as u32 * 32)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn __hash__(&self) -> isize {
+        Rc::as_ptr(&self.inner) as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hsdraw.Pobj addr=0x{:X}>",
+            Rc::as_ptr(&self.inner) as usize
+        )
+    }
+}
+
+// =====================================================================
+// MObj typed view  (HSDLib HSD_MOBJ accessor)
+// =====================================================================
+
+/// Typed view onto a 0x18-byte HSD_MOBJ struct.  Holds the render
+/// flags + textures (TObj chain) + Material reference + PE descriptor.
+/// Construct via `MObj.alloc()` (empty) or `MObj.alloc_unlit_color()`
+/// (one-stop unlit single-color preset), then attach via
+/// `DObj.set_mobj`.
+#[pyclass(name = "MObj", module = "hsdraw", unsendable)]
+struct PyMObj {
+    inner: StructRef,
+}
+
+#[pymethods]
+impl PyMObj {
+    /// Allocate a fresh 0x18-byte HSD_MOBJ.  All fields zero (no
+    /// render flags / no Material / no Textures / no PE).
+    #[staticmethod]
+    fn alloc() -> Self {
+        Self { inner: CoreMObj::allocate_default().0 }
+    }
+
+    /// "Unlit single-color" preset.  Render flags = `CONSTANT |
+    /// DIFFUSE`; a fresh `Material` is attached with diffuse RGBA8 =
+    /// (r, g, b, a), alpha = 1.0, shininess = 50.0.  No textures, no
+    /// PE descriptor.  Useful as the placeholder material for a
+    /// brand-new mesh that doesn't have a real material yet.
+    #[staticmethod]
+    fn alloc_unlit_color(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { inner: CoreMObj::allocate_unlit_color(r, g, b, a).0 }
+    }
+
+    #[staticmethod]
+    fn from_struct(s: &PyHsdStruct) -> Self {
+        Self { inner: s.inner.clone() }
+    }
+
+    fn as_struct(&self) -> PyHsdStruct {
+        PyHsdStruct { inner: self.inner.clone() }
+    }
+
+    /// `RENDER_MODE` bits (matches HSDLib's `RENDER_MODE` enum: see
+    /// `crates/hsdraw-core/src/gx.rs`'s `MaterialRenderMode` constants).
+    #[getter]
+    fn render_flags(&self) -> PyResult<u32> {
+        CoreMObj::from_struct(self.inner.clone())
+            .render_flags()
+            .map(|f| f.bits())
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_render_flags(&self, bits: u32) -> PyResult<()> {
+        CoreMObj::from_struct(self.inner.clone())
+            .set_render_flags(MaterialRenderMode::from_bits_retain(bits))
+            .map_err(map_err)
+    }
+
+    /// Attached Material, or `None`.
+    #[getter]
+    fn material(&self) -> Option<PyMaterial> {
+        self.inner
+            .borrow()
+            .get_reference(0x0C)
+            .map(|s| PyMaterial { inner: s })
+    }
+
+    /// Attached PE descriptor, or `None`.
+    #[getter]
+    fn pe_desc(&self) -> Option<PyPeDesc> {
+        self.inner
+            .borrow()
+            .get_reference(0x14)
+            .map(|s| PyPeDesc { inner: s })
+    }
+
+    /// Attached TObj chain head, or `None` (returned as raw
+    /// `HsdStruct` since this binding doesn't yet ship a typed TObj
+    /// wrapper — texture re-pack is roadmapped, see `docs/roadmap.md`).
+    #[getter]
+    fn textures(&self) -> Option<PyHsdStruct> {
+        self.inner
+            .borrow()
+            .get_reference(0x08)
+            .map(|s| PyHsdStruct { inner: s })
+    }
+
+    #[pyo3(signature = (material=None))]
+    fn set_material(&self, material: Option<&PyMaterial>) {
+        CoreMObj::from_struct(self.inner.clone()).set_material(
+            material.map(|m| CoreMaterial::from_struct(m.inner.clone())),
+        );
+    }
+
+    #[pyo3(signature = (pe=None))]
+    fn set_pe_desc(&self, pe: Option<&PyPeDesc>) {
+        CoreMObj::from_struct(self.inner.clone()).set_pe_desc(
+            pe.map(|p| CorePeDesc::from_struct(p.inner.clone())),
+        );
+    }
+
+    /// Set the TObj chain head.  Accepts a raw `HsdStruct` (typed
+    /// TObj wrapper not yet shipped); `None` detaches.
+    #[pyo3(signature = (tobj=None))]
+    fn set_textures(&self, tobj: Option<&PyHsdStruct>) {
+        let mut s = self.inner.borrow_mut();
+        s.set_reference(0x08, tobj.map(|t| t.inner.clone()));
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn __hash__(&self) -> isize {
+        Rc::as_ptr(&self.inner) as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hsdraw.MObj addr=0x{:X}>",
+            Rc::as_ptr(&self.inner) as usize
+        )
+    }
+}
+
+// =====================================================================
+// Material typed view  (HSDLib HSD_Material accessor)
+// =====================================================================
+
+/// Typed view onto a 0x14-byte HSD_Material struct.  Holds ambient /
+/// diffuse / specular RGBA8 + alpha (f32) + shininess (f32).  Attach
+/// via `MObj.set_material`.
+#[pyclass(name = "Material", module = "hsdraw", unsendable)]
+struct PyMaterial {
+    inner: StructRef,
+}
+
+#[pymethods]
+impl PyMaterial {
+    /// Allocate a fresh 0x14-byte Material with all-zero fields.
+    #[staticmethod]
+    fn alloc() -> Self {
+        Self { inner: CoreMaterial::allocate_default().0 }
+    }
+
+    #[staticmethod]
+    fn from_struct(s: &PyHsdStruct) -> Self {
+        Self { inner: s.inner.clone() }
+    }
+
+    fn as_struct(&self) -> PyHsdStruct {
+        PyHsdStruct { inner: self.inner.clone() }
+    }
+
+    #[getter]
+    fn amb_rgba(&self) -> PyResult<(u8, u8, u8, u8)> {
+        let v = CoreMaterial::from_struct(self.inner.clone())
+            .amb_rgba()
+            .map_err(map_err)?;
+        Ok((v[0], v[1], v[2], v[3]))
+    }
+
+    #[setter]
+    fn set_amb_rgba(&self, rgba: (u8, u8, u8, u8)) -> PyResult<()> {
+        CoreMaterial::from_struct(self.inner.clone())
+            .set_amb_rgba([rgba.0, rgba.1, rgba.2, rgba.3])
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn dif_rgba(&self) -> PyResult<(u8, u8, u8, u8)> {
+        let v = CoreMaterial::from_struct(self.inner.clone())
+            .dif_rgba()
+            .map_err(map_err)?;
+        Ok((v[0], v[1], v[2], v[3]))
+    }
+
+    #[setter]
+    fn set_dif_rgba(&self, rgba: (u8, u8, u8, u8)) -> PyResult<()> {
+        CoreMaterial::from_struct(self.inner.clone())
+            .set_dif_rgba([rgba.0, rgba.1, rgba.2, rgba.3])
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn spc_rgba(&self) -> PyResult<(u8, u8, u8, u8)> {
+        let v = CoreMaterial::from_struct(self.inner.clone())
+            .spc_rgba()
+            .map_err(map_err)?;
+        Ok((v[0], v[1], v[2], v[3]))
+    }
+
+    #[setter]
+    fn set_spc_rgba(&self, rgba: (u8, u8, u8, u8)) -> PyResult<()> {
+        CoreMaterial::from_struct(self.inner.clone())
+            .set_spc_rgba([rgba.0, rgba.1, rgba.2, rgba.3])
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn alpha(&self) -> PyResult<f32> {
+        CoreMaterial::from_struct(self.inner.clone())
+            .alpha()
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_alpha(&self, v: f32) -> PyResult<()> {
+        CoreMaterial::from_struct(self.inner.clone())
+            .set_alpha(v)
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn shininess(&self) -> PyResult<f32> {
+        CoreMaterial::from_struct(self.inner.clone())
+            .shininess()
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_shininess(&self, v: f32) -> PyResult<()> {
+        CoreMaterial::from_struct(self.inner.clone())
+            .set_shininess(v)
+            .map_err(map_err)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn __hash__(&self) -> isize {
+        Rc::as_ptr(&self.inner) as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hsdraw.Material addr=0x{:X}>",
+            Rc::as_ptr(&self.inner) as usize
+        )
+    }
+}
+
+// =====================================================================
+// PeDesc typed view  (HSDLib HSD_PEDesc accessor)
+// =====================================================================
+
+/// Typed view onto a 0xC-byte HSD_PEDesc (Pixel-process Engine
+/// descriptor).  Holds blend mode + factors + depth/alpha test setup.
+/// All fields are u8 — refer to `HSDRaw/Common/HSD_MOBJ.cs` /
+/// `HSDRaw/GX/Enums.cs` for the GX enum values.  Attach via
+/// `MObj.set_pe_desc`.
+#[pyclass(name = "PeDesc", module = "hsdraw", unsendable)]
+struct PyPeDesc {
+    inner: StructRef,
+}
+
+#[pymethods]
+impl PyPeDesc {
+    #[staticmethod]
+    fn alloc() -> Self {
+        Self { inner: CorePeDesc::allocate_default().0 }
+    }
+
+    #[staticmethod]
+    fn from_struct(s: &PyHsdStruct) -> Self {
+        Self { inner: s.inner.clone() }
+    }
+
+    fn as_struct(&self) -> PyHsdStruct {
+        PyHsdStruct { inner: self.inner.clone() }
+    }
+
+    #[getter] fn flags(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).flags().map_err(map_err) }
+    #[getter] fn alpha_ref0(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).alpha_ref0().map_err(map_err) }
+    #[getter] fn alpha_ref1(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).alpha_ref1().map_err(map_err) }
+    #[getter] fn destination_alpha(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).destination_alpha().map_err(map_err) }
+    #[getter] fn blend_mode(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).blend_mode().map_err(map_err) }
+    #[getter] fn src_factor(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).src_factor().map_err(map_err) }
+    #[getter] fn dst_factor(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).dst_factor().map_err(map_err) }
+    #[getter] fn blend_op(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).blend_op().map_err(map_err) }
+    #[getter] fn depth_function(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).depth_function().map_err(map_err) }
+    #[getter] fn alpha_comp0(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).alpha_comp0().map_err(map_err) }
+    #[getter] fn alpha_op(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).alpha_op().map_err(map_err) }
+    #[getter] fn alpha_comp1(&self) -> PyResult<u8> { CorePeDesc::from_struct(self.inner.clone()).alpha_comp1().map_err(map_err) }
+
+    #[setter] fn set_flags(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_flags(v).map_err(map_err) }
+    #[setter] fn set_alpha_ref0(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_alpha_ref0(v).map_err(map_err) }
+    #[setter] fn set_alpha_ref1(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_alpha_ref1(v).map_err(map_err) }
+    #[setter] fn set_destination_alpha(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_destination_alpha(v).map_err(map_err) }
+    #[setter] fn set_blend_mode(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_blend_mode(v).map_err(map_err) }
+    #[setter] fn set_src_factor(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_src_factor(v).map_err(map_err) }
+    #[setter] fn set_dst_factor(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_dst_factor(v).map_err(map_err) }
+    #[setter] fn set_blend_op(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_blend_op(v).map_err(map_err) }
+    #[setter] fn set_depth_function(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_depth_function(v).map_err(map_err) }
+    #[setter] fn set_alpha_comp0(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_alpha_comp0(v).map_err(map_err) }
+    #[setter] fn set_alpha_op(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_alpha_op(v).map_err(map_err) }
+    #[setter] fn set_alpha_comp1(&self, v: u8) -> PyResult<()> { CorePeDesc::from_struct(self.inner.clone()).set_alpha_comp1(v).map_err(map_err) }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn __hash__(&self) -> isize {
+        Rc::as_ptr(&self.inner) as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hsdraw.PeDesc addr=0x{:X}>",
+            Rc::as_ptr(&self.inner) as usize
+        )
+    }
+}
+
+// =====================================================================
+// MeshBuilder  (HSDLib POBJ_Generator equivalent for Phase 1)
+// =====================================================================
+
+/// Phase 1 POBJ writer.  Push positions / normals / colors / UVs /
+/// triangles, then call `build()` for a `Pobj`.  See
+/// `docs/python_api.md` for the full surface; the constraints in one
+/// line: TRIANGLES only, ≤ 65,535 verts per POBJ, fixed attribute
+/// formats (POS F32×3, NRM F32×3, CLR0 RGBA8, TEX0 F32×2), no envelope
+/// rigging.
+#[pyclass(name = "MeshBuilder", module = "hsdraw", unsendable)]
+struct PyMeshBuilder {
+    inner: RefCell<CoreMeshBuilder>,
+}
+
+#[pymethods]
+impl PyMeshBuilder {
+    #[new]
+    fn new() -> Self {
+        Self { inner: RefCell::new(CoreMeshBuilder::new()) }
+    }
+
+    fn add_position(&self, x: f32, y: f32, z: f32) {
+        self.inner.borrow_mut().add_position(x, y, z);
+    }
+
+    fn add_normal(&self, x: f32, y: f32, z: f32) {
+        self.inner.borrow_mut().add_normal(x, y, z);
+    }
+
+    fn add_color(&self, r: u8, g: u8, b: u8, a: u8) {
+        self.inner.borrow_mut().add_color(r, g, b, a);
+    }
+
+    fn add_uv(&self, u: f32, v: f32) {
+        self.inner.borrow_mut().add_uv(u, v);
+    }
+
+    fn add_triangle(&self, i0: u32, i1: u32, i2: u32) {
+        self.inner.borrow_mut().add_triangle(i0, i1, i2);
+    }
+
+    fn set_cull_back(&self, on: bool) {
+        self.inner.borrow_mut().set_cull_back(on);
+    }
+
+    fn set_cull_front(&self, on: bool) {
+        self.inner.borrow_mut().set_cull_front(on);
+    }
+
+    /// Toggle Phase 2 greedy `TRIANGLE_STRIP` decomposition.  On by
+    /// default — pass `False` to force the Phase 1 single-`Triangles`-
+    /// group emit path (handy when comparing DL bytecode against
+    /// HSDLib's output, or when you need predictable byte layouts).
+    fn set_use_triangle_strips(&self, on: bool) {
+        self.inner.borrow_mut().set_use_triangle_strips(on);
+    }
+
+    /// Phase 3: add a new envelope (one matrix slot's worth of bone
+    /// influences).  `weights` is a Python iterable of
+    /// `(JObj, weight: float)` tuples; weights should sum to ~1.0.
+    /// Returns the envelope index (0-based) for use with
+    /// `add_envelope_index`.  Each envelope reserves 3 GX matrix
+    /// slots (pos / normal / binormal), so the effective max is 85
+    /// envelopes per POBJ — split into multiple POBJs above that.
+    fn add_envelope(
+        &self,
+        weights: &Bound<'_, PyAny>,
+    ) -> PyResult<u32> {
+        // PyO3 0.28's `Vec<(PyJObj, f32)>` extraction needs
+        // `FromPyObjectOwned`, which `#[pyclass]` types don't get for
+        // free.  Iterate the input ourselves and downcast each tuple
+        // element manually — same effect, fewer trait gymnastics.
+        let mut core_weights: Vec<(CoreJObj, f32)> = Vec::new();
+        for item in weights.try_iter()? {
+            let pair = item?;
+            let tup: (Bound<'_, PyAny>, f32) = pair.extract()?;
+            let jobj_ref = tup.0.cast::<PyJObj>().map_err(|_| {
+                PyTypeError::new_err(
+                    "MeshBuilder.add_envelope: tuple element 0 must be a JObj",
+                )
+            })?;
+            let jobj_inner = jobj_ref.borrow().inner.clone();
+            core_weights.push((CoreJObj::from_struct(jobj_inner), tup.1));
+        }
+        Ok(self.inner.borrow_mut().add_envelope(core_weights))
+    }
+
+    /// Per-vertex envelope index (parallel to position pushes).  When
+    /// envelopes are in use, every vertex must have an associated
+    /// envelope; the count must match positions.  `env_idx` references
+    /// the envelopes added via `add_envelope`.
+    fn add_envelope_index(&self, env_idx: u32) {
+        self.inner.borrow_mut().add_envelope_index(env_idx);
+    }
+
+    fn envelope_count(&self) -> usize {
+        self.inner.borrow().envelope_count()
+    }
+
+    fn vertex_count(&self) -> usize {
+        self.inner.borrow().vertex_count()
+    }
+
+    fn triangle_count(&self) -> usize {
+        self.inner.borrow().triangle_count()
+    }
+
+    /// Validate inputs and produce the `Pobj`.  Consumes the builder
+    /// (subsequent calls raise `RuntimeError`).
+    fn build(&self) -> PyResult<PyPObj> {
+        // Take the inner builder out so build's by-value consumption
+        // works.  Subsequent calls find a default builder which fails
+        // validation immediately — predictable error path.
+        let mb = self.inner.replace(CoreMeshBuilder::new());
+        let pobj = mb.build().map_err(map_err)?;
+        Ok(PyPObj { inner: pobj.0 })
+    }
+
+    fn __repr__(&self) -> String {
+        let mb = self.inner.borrow();
+        format!(
+            "<hsdraw.MeshBuilder verts={} tris={}>",
+            mb.vertex_count(),
+            mb.triangle_count()
+        )
+    }
+}
+
+// =====================================================================
 // Module-level functions (kept for backwards compat with the Phase 4
 // API; users can now also do `dat = parse_dat(b); dat.write()` instead
 // of going through `write_dat(b)`).
@@ -471,18 +1136,35 @@ fn write_dat<'py>(
 // Helpers
 // =====================================================================
 
-/// Accept either a `JObj` or `HsdStruct` Python instance and return
-/// the shared `StructRef`.  Anything else is `TypeError`.
+/// Accept any of the typed-view wrappers or a raw `HsdStruct` and
+/// return the shared `StructRef`.  Anything else is `TypeError`.  Used
+/// by every cross-typed-view setter (`Dat.add_root`, `DObj.set_mobj`,
+/// etc.) so a Python user can pass whatever handle they happen to have.
 fn struct_ref_from_any(any: &Bound<'_, PyAny>) -> PyResult<StructRef> {
     if let Ok(j) = any.cast::<PyJObj>() {
-        Ok(j.borrow().inner.clone())
-    } else if let Ok(s) = any.cast::<PyHsdStruct>() {
-        Ok(s.borrow().inner.clone())
-    } else {
-        Err(PyTypeError::new_err(
-            "expected JObj or HsdStruct (got something else)",
-        ))
+        return Ok(j.borrow().inner.clone());
     }
+    if let Ok(d) = any.cast::<PyDObj>() {
+        return Ok(d.borrow().inner.clone());
+    }
+    if let Ok(p) = any.cast::<PyPObj>() {
+        return Ok(p.borrow().inner.clone());
+    }
+    if let Ok(m) = any.cast::<PyMObj>() {
+        return Ok(m.borrow().inner.clone());
+    }
+    if let Ok(m) = any.cast::<PyMaterial>() {
+        return Ok(m.borrow().inner.clone());
+    }
+    if let Ok(p) = any.cast::<PyPeDesc>() {
+        return Ok(p.borrow().inner.clone());
+    }
+    if let Ok(s) = any.cast::<PyHsdStruct>() {
+        return Ok(s.borrow().inner.clone());
+    }
+    Err(PyTypeError::new_err(
+        "expected JObj / DObj / Pobj / MObj / Material / PeDesc / HsdStruct",
+    ))
 }
 
 #[allow(dead_code)]
@@ -509,5 +1191,11 @@ fn hsdraw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRoot>()?;
     m.add_class::<PyHsdStruct>()?;
     m.add_class::<PyJObj>()?;
+    m.add_class::<PyDObj>()?;
+    m.add_class::<PyPObj>()?;
+    m.add_class::<PyMObj>()?;
+    m.add_class::<PyMaterial>()?;
+    m.add_class::<PyPeDesc>()?;
+    m.add_class::<PyMeshBuilder>()?;
     Ok(())
 }

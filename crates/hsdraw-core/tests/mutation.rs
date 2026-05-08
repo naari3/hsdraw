@@ -341,3 +341,51 @@ fn jobj_identity_via_rc_clone() {
     let c = JObj::allocate_default();
     assert!(!ptr_eq(&a.0, &c.0));
 }
+
+// =====================================================================
+// HsdStruct::references() / get_reference() — exercises the raw-ref
+// walk path the mkgp2-patch addon's Pass 0 uses (it has no SObj typed
+// accessor in Python, so it must enumerate references itself to reach
+// the JOBJDescs[] array out of scene_data).
+// =====================================================================
+
+#[test]
+fn synthetic_struct_references_enumerate() {
+    let dat = build_synthetic_tree();
+    let scene = dat.scene_data().expect("scene_data root present");
+
+    // SOBJ has exactly one reference: offset 0x00 → JOBJDescs[] array.
+    let refs = {
+        let s = scene.data.borrow();
+        s.references()
+            .iter()
+            .map(|(off, t)| (*off, t.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(refs.len(), 1, "SOBJ should have exactly one reference");
+    assert_eq!(refs[0].0, 0x00);
+
+    // get_reference(0x00) hits; out-of-range offset returns None.
+    let descs_arr = scene
+        .data
+        .borrow()
+        .get_reference(0x00)
+        .expect("offset 0 ref present");
+    assert!(scene.data.borrow().get_reference(0x10).is_none());
+    // The references()-iterated entry and the get_reference()-found
+    // entry must be the same Rc allocation, not a byte-equal copy.
+    assert!(ptr_eq(&descs_arr, &refs[0].1));
+
+    // Walk: descs_arr[0] → JObjDesc → RootJoint, and the recovered JObj
+    // must have the tx=1.0 we tagged the synthetic root with.
+    let desc = descs_arr
+        .borrow()
+        .get_reference(0x00)
+        .expect("descs_arr[0] present");
+    let root_joint = desc
+        .borrow()
+        .get_reference(0x00)
+        .expect("desc.RootJoint present");
+    let root = JObj::from_struct(root_joint);
+    assert!((root.tx().unwrap() - 1.0).abs() < 1e-6);
+}

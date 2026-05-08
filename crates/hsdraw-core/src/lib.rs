@@ -14,6 +14,7 @@ pub mod gx;
 pub mod gx_dl;
 pub mod gx_image;
 pub mod hsd_struct;
+pub mod pobj_writer;
 pub mod writer;
 
 pub use accessor::Accessor;

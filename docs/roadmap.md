@@ -8,30 +8,54 @@ are roughly ordered by leverage on the MKGP2 add-on workflow.
 **csx parity status:** csx itself doesn't have one.  The
 `hsd_import_from_blender.csx` script intentionally only mutates
 structural fields (joint hierarchy / alias roots / TRS / flags); mesh
-content is taken verbatim from the base .dat.
+content is taken verbatim from the base .dat.  hsdraw's POBJ writer is
+the upstream of csx in this regard.
 
-**Goal:** consume the JSON `meshes[]` (vertex / primitive arrays
-already present in `scene.json`) and re-encode them as GX display-list
-bytes plus a fresh `HSD_POBJ` accessor + attribute table.  This is the
-direction the add-on actually wants — without it, "edit a mesh in
-Blender → save .dat" still requires HSDRawViewer's IONET importer.
+### Phase 1–3 — done
 
-**Sketch:**
+- `pobj_writer::MeshBuilder` Rust core: positions / normals / colors /
+  UVs / triangle indices → `PObj`, with optional envelope rigging.
+- **Phase 1 (TRIANGLES emit)**: `GX_DRAW_TRIANGLES = 0x90`, GX_INDEX16
+  attributes, single attribute group per POBJ.  Fixed encoding: POS
+  F32×3, NRM F32×3, CLR0 RGBA8, TEX0 F32×2.
+- **Phase 2 (TRIANGLE_STRIP optimization)**: greedy stripper (3-way
+  orientation pick, edge-adjacency walk) producing `0x98 (TriangleStrip)`
+  primitive groups for chains of ≥ 4 verts plus a trailing `Triangles`
+  group for the leftover.  Toggle via `MeshBuilder.set_use_triangle_strips`
+  (default on); the strip output has been measured smaller than the
+  Phase 1 path on the 96-tri ribbon test.  Not the full HSDLib
+  `TriangleConverter` (no vertex-cache simulator / priority heap), but
+  fast and good-enough for course-mesh input sizes.
+- **Phase 3 (envelope rigging)**: `MeshBuilder.add_envelope` +
+  `add_envelope_index` for skinned meshes.  Sets `POBJ_FLAG.ENVELOPE`,
+  emits `GX_VA_PNMTXIDX` as the first attribute (DIRECT, 1 byte), wires
+  a null-terminated array of `HSD_Envelope` structs at POBJ + 0x14.
+  Per-vertex `PNMTXIDX` value is `(envelope_index × 3)` — each envelope
+  reserves a pos/normal/binormal triple of GX matrix slots.  Capped at
+  85 envelopes per POBJ (`u8` matrix slot range); split into multiple
+  POBJs above that.
+- `DObj::allocate_default` + `set_mobj` / `set_pobj`, `JObj::set_dobj`
+  primitives so the new POBJ can be wired into an existing tree.
+- `MObj::allocate_default` / `allocate_unlit_color`, `Material` /
+  `PeDesc` allocation + per-field setters for new-material attach.
+- 14 round-trip tests in `tests/pobj_writer.rs` (Phase 1 single-tri /
+  quad / +nrm+clr / +UV / 96-vert ribbon, Phase 2 strip variants +
+  byte-size shrinkage gate, Phase 3 envelope round-trip + validation
+  rejections + envelope-with-strips combo) plus 5 in `tests/mobj_writer.rs`
+  (default sizes, unlit preset round-trip, explicit-setter round-trip).
+- PyO3 expose: `MeshBuilder` (with `set_use_triangle_strips` /
+  `add_envelope` / `add_envelope_index`), `Pobj` / `DObj` / `MObj` /
+  `Material` / `PeDesc` Python classes, `JObj.set_dobj`.
 
-1. Add a writer-side mirror of `gx_dl::unpack`: take a
-   `Vec<Vertex>` + `Vec<Primitive>`, decide ATTR layout (DIRECT /
-   INDEX8 / INDEX16 per attr) the way HSDLib's
-   `GX_VertexAccessor.SetVertices` does, then emit the DL bytecode.
-2. Allocate a new `HSD_POBJ` struct, fill the attribute table at
-   offset 0x08, the DL size at 0x0C, and the DL buffer ref at 0x10.
-3. Re-link DObj → POBJ chain when the JSON mesh `material_index` /
-   `pobj_index` changes.
+### Future widening (not in scope yet)
 
-**Why not yet:** the GX DL encoder is an honest
-`gx_dl::unpack` inverse — needs a quantization decision per attribute,
-buffer dedup, and a bounded-precision check (positions go through
-GX_F32 by default but I8/S8/U8 are tempting for size).  A few-day
-project worth taking up once the import edit loop actually wants it.
+- **Vertex-cache-aware stripper**: HSDLib's full `TriangleConverter`
+  port for tighter strip output on large meshes.  Mechanical but
+  multi-day work.
+- **Multiple primitive groups with mixed envelope sets per POBJ**:
+  HSDLib's `POBJ_Generator` re-groups primitives by influence-set; the
+  current writer puts everything in one POBJ regardless.  Useful for
+  fighter data where one logical mesh spans many bone groups.
 
 ## Texture re-pack from PNG
 

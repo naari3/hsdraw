@@ -78,6 +78,21 @@ impl JObj {
     pub fn set_ty(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x30, v) }
     pub fn set_tz(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x34, v) }
 
+    /// Set / clear the DObj reference at offset 0x10.  Mirrors HSDLib's
+    /// `HSD_JOBJ.Dobj = …` setter, which clears `SPLINE` and `PTCL` flags
+    /// (those bits use the same 0x10 slot as a tagged-union payload).
+    /// Pass `None` to detach.
+    pub fn set_dobj(&self, dobj: Option<DObj>) -> Result<()> {
+        self.ensure_jobj_size();
+        self.0
+            .borrow_mut()
+            .set_reference(0x10, dobj.map(|d| d.0));
+        let f = self.flags()?;
+        let cleared = f.bits()
+            & !(JObjFlag::SPLINE.bits() | JObjFlag::PTCL.bits());
+        self.set_flags(JObjFlag::from_bits_retain(cleared))
+    }
+
     /// Allocate a brand-new HSD_JOBJ struct: 0x40 bytes, scale=(1,1,1),
     /// everything else zero (matches HSDLib `new HSD_JOBJ()` post-ctor
     /// state plus the SX/SY/SZ identity init the csx import script does).
@@ -116,6 +131,37 @@ impl DObj {
     pub fn next(&self) -> Option<DObj> { self.ref_at::<DObj>(0x04) }
     pub fn mobj(&self) -> Option<MObj> { self.ref_at::<MObj>(0x08) }
     pub fn pobj(&self) -> Option<PObj> { self.ref_at::<PObj>(0x0C) }
+
+    // ----- mutators ------------------------------------------------
+    /// Allocate a brand-new HSD_DOBJ: 0x10 bytes, all zero.  Matches
+    /// HSDLib `new HSD_DOBJ()` post-ctor state.  Caller is responsible
+    /// for keeping the `Rc` alive (typically by passing it through
+    /// `JObj::set_dobj`).
+    pub fn allocate_default() -> Self {
+        DObj::from_struct(HsdStruct::with_capacity(0x10).into_ref())
+    }
+
+    pub fn set_next(&self, next: Option<DObj>) {
+        self.ensure_dobj_size();
+        self.0.borrow_mut().set_reference(0x04, next.map(|d| d.0));
+    }
+
+    pub fn set_mobj(&self, mobj: Option<MObj>) {
+        self.ensure_dobj_size();
+        self.0.borrow_mut().set_reference(0x08, mobj.map(|m| m.0));
+    }
+
+    pub fn set_pobj(&self, pobj: Option<PObj>) {
+        self.ensure_dobj_size();
+        self.0.borrow_mut().set_reference(0x0C, pobj.map(|p| p.0));
+    }
+
+    fn ensure_dobj_size(&self) {
+        let mut s = self.0.borrow_mut();
+        if s.len() < 0x10 {
+            s.resize(0x10);
+        }
+    }
 }
 
 // =====================================================================
@@ -132,6 +178,63 @@ impl MObj {
     pub fn textures(&self) -> Option<TObj> { self.ref_at::<TObj>(0x08) }
     pub fn material(&self) -> Option<Material> { self.ref_at::<Material>(0x0C) }
     pub fn pe_desc(&self) -> Option<PeDesc> { self.ref_at::<PeDesc>(0x14) }
+
+    // ----- mutators ------------------------------------------------
+    /// Allocate a fresh HSD_MOBJ: 0x18 bytes, all-zero fields (no
+    /// textures / material / PE attached).  Mirrors HSDLib `new
+    /// HSD_MOBJ()` post-ctor state.
+    pub fn allocate_default() -> Self {
+        MObj::from_struct(HsdStruct::with_capacity(0x18).into_ref())
+    }
+
+    /// "Unlit single-color" preset: render flags `CONSTANT |
+    /// DIFFUSE`, a fresh `Material` with diffuse RGBA8 = (r, g, b, a),
+    /// alpha = 1.0, shininess = 50.0 (HSDLib's default in `Trim`),
+    /// no textures, no PE descriptor.  Useful as a placeholder when
+    /// the addon doesn't yet have a real material to point at.
+    pub fn allocate_unlit_color(r: u8, g: u8, b: u8, a: u8) -> Self {
+        let mobj = Self::allocate_default();
+        let _ = mobj.set_render_flags(
+            MaterialRenderMode::CONSTANT | MaterialRenderMode::DIFFUSE,
+        );
+        let mat = Material::allocate_default();
+        let _ = mat.set_dif_rgba([r, g, b, a]);
+        let _ = mat.set_alpha(1.0);
+        let _ = mat.set_shininess(50.0);
+        mobj.set_material(Some(mat));
+        mobj
+    }
+
+    pub fn set_render_flags(&self, flags: MaterialRenderMode) -> Result<()> {
+        self.ensure_mobj_size();
+        self.0.borrow_mut().set_u32(0x04, flags.bits())
+    }
+
+    pub fn set_textures(&self, textures: Option<TObj>) {
+        self.ensure_mobj_size();
+        self.0
+            .borrow_mut()
+            .set_reference(0x08, textures.map(|t| t.0));
+    }
+
+    pub fn set_material(&self, material: Option<Material>) {
+        self.ensure_mobj_size();
+        self.0
+            .borrow_mut()
+            .set_reference(0x0C, material.map(|m| m.0));
+    }
+
+    pub fn set_pe_desc(&self, pe: Option<PeDesc>) {
+        self.ensure_mobj_size();
+        self.0.borrow_mut().set_reference(0x14, pe.map(|p| p.0));
+    }
+
+    fn ensure_mobj_size(&self) {
+        let mut s = self.0.borrow_mut();
+        if s.len() < 0x18 {
+            s.resize(0x18);
+        }
+    }
 }
 
 // =====================================================================
@@ -155,6 +258,59 @@ impl Material {
     }
     pub fn alpha(&self) -> Result<f32> { self.s().get_f32(0x0C) }
     pub fn shininess(&self) -> Result<f32> { self.s().get_f32(0x10) }
+
+    // ----- mutators ------------------------------------------------
+    /// Allocate a fresh HSD_Material: 0x14 bytes, all-zero fields
+    /// (ambient/diffuse/specular = (0,0,0,0), alpha = 0.0, shininess = 0.0).
+    /// Mirrors HSDLib `new HSD_Material()` post-ctor state.  Pair with
+    /// `set_*_rgba` / `set_alpha` / `set_shininess` for sensible values.
+    pub fn allocate_default() -> Self {
+        Material::from_struct(HsdStruct::with_capacity(0x14).into_ref())
+    }
+
+    pub fn set_amb_rgba(&self, rgba: [u8; 4]) -> Result<()> {
+        self.ensure_material_size();
+        let mut s = self.0.borrow_mut();
+        for i in 0..4 {
+            s.data_mut()[i] = rgba[i];
+        }
+        Ok(())
+    }
+
+    pub fn set_dif_rgba(&self, rgba: [u8; 4]) -> Result<()> {
+        self.ensure_material_size();
+        let mut s = self.0.borrow_mut();
+        for i in 0..4 {
+            s.data_mut()[0x04 + i] = rgba[i];
+        }
+        Ok(())
+    }
+
+    pub fn set_spc_rgba(&self, rgba: [u8; 4]) -> Result<()> {
+        self.ensure_material_size();
+        let mut s = self.0.borrow_mut();
+        for i in 0..4 {
+            s.data_mut()[0x08 + i] = rgba[i];
+        }
+        Ok(())
+    }
+
+    pub fn set_alpha(&self, v: f32) -> Result<()> {
+        self.ensure_material_size();
+        self.0.borrow_mut().set_f32(0x0C, v)
+    }
+
+    pub fn set_shininess(&self, v: f32) -> Result<()> {
+        self.ensure_material_size();
+        self.0.borrow_mut().set_f32(0x10, v)
+    }
+
+    fn ensure_material_size(&self) {
+        let mut s = self.0.borrow_mut();
+        if s.len() < 0x14 {
+            s.resize(0x14);
+        }
+    }
 }
 
 // =====================================================================
@@ -162,6 +318,50 @@ impl Material {
 // =====================================================================
 
 accessor!(PeDesc);
+
+impl PeDesc {
+    pub fn flags(&self) -> Result<u8> { self.s().get_byte(0x00) }
+    pub fn alpha_ref0(&self) -> Result<u8> { self.s().get_byte(0x01) }
+    pub fn alpha_ref1(&self) -> Result<u8> { self.s().get_byte(0x02) }
+    pub fn destination_alpha(&self) -> Result<u8> { self.s().get_byte(0x03) }
+    pub fn blend_mode(&self) -> Result<u8> { self.s().get_byte(0x04) }
+    pub fn src_factor(&self) -> Result<u8> { self.s().get_byte(0x05) }
+    pub fn dst_factor(&self) -> Result<u8> { self.s().get_byte(0x06) }
+    pub fn blend_op(&self) -> Result<u8> { self.s().get_byte(0x07) }
+    pub fn depth_function(&self) -> Result<u8> { self.s().get_byte(0x08) }
+    pub fn alpha_comp0(&self) -> Result<u8> { self.s().get_byte(0x09) }
+    pub fn alpha_op(&self) -> Result<u8> { self.s().get_byte(0x0A) }
+    pub fn alpha_comp1(&self) -> Result<u8> { self.s().get_byte(0x0B) }
+
+    /// Allocate a fresh HSD_PEDesc: 0xC bytes, all-zero fields.
+    /// Mirrors HSDLib `new HSD_PEDesc()` post-ctor state.  Use the
+    /// per-byte setters below to fill in blend mode / depth test / etc.
+    pub fn allocate_default() -> Self {
+        PeDesc::from_struct(HsdStruct::with_capacity(0xC).into_ref())
+    }
+
+    pub fn set_flags(&self, v: u8) -> Result<()> { self.put_byte(0x00, v) }
+    pub fn set_alpha_ref0(&self, v: u8) -> Result<()> { self.put_byte(0x01, v) }
+    pub fn set_alpha_ref1(&self, v: u8) -> Result<()> { self.put_byte(0x02, v) }
+    pub fn set_destination_alpha(&self, v: u8) -> Result<()> { self.put_byte(0x03, v) }
+    pub fn set_blend_mode(&self, v: u8) -> Result<()> { self.put_byte(0x04, v) }
+    pub fn set_src_factor(&self, v: u8) -> Result<()> { self.put_byte(0x05, v) }
+    pub fn set_dst_factor(&self, v: u8) -> Result<()> { self.put_byte(0x06, v) }
+    pub fn set_blend_op(&self, v: u8) -> Result<()> { self.put_byte(0x07, v) }
+    pub fn set_depth_function(&self, v: u8) -> Result<()> { self.put_byte(0x08, v) }
+    pub fn set_alpha_comp0(&self, v: u8) -> Result<()> { self.put_byte(0x09, v) }
+    pub fn set_alpha_op(&self, v: u8) -> Result<()> { self.put_byte(0x0A, v) }
+    pub fn set_alpha_comp1(&self, v: u8) -> Result<()> { self.put_byte(0x0B, v) }
+
+    fn put_byte(&self, off: usize, v: u8) -> Result<()> {
+        let mut s = self.0.borrow_mut();
+        if s.len() < 0xC {
+            s.resize(0xC);
+        }
+        s.data_mut()[off] = v;
+        Ok(())
+    }
+}
 
 // =====================================================================
 // PObj  (HSDRaw/Common/HSD_POBJ.cs, TrimmedSize 0x18)

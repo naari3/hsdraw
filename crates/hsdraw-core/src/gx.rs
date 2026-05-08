@@ -158,6 +158,13 @@ impl MaterialRenderMode {
     }
 }
 
+impl std::ops::BitOr for MaterialRenderMode {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
 // =====================================================================
 // TOBJ_FLAGS (HSDRaw/Common/HSD_TOBJ.cs:10)
 // =====================================================================

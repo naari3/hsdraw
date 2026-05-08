@@ -1,0 +1,270 @@
+//! High-level accessors mapping to `HSDRaw/Common/HSD_*.cs`.  Phase 1 carries
+//! only the read-side fields needed for the JObj tree dump and the future
+//! Blender JSON export; field names match HSDLib exactly so cross-referencing
+//! the C# source is mechanical.
+
+use crate::accessor::{Accessor, accessor};
+use crate::error::Result;
+use crate::gx::{GxTexFmt, GxTexMapId, GxTexFilter, GxWrapMode, JObjFlag, MaterialRenderMode, PObjFlag, TObjFlags, AlphaMap, ColorMap, CoordType, GxTlutFmt};
+use crate::hsd_struct::{HsdStruct, StructRef};
+
+// =====================================================================
+// JObj  (HSDRaw/Common/HSD_JOBJ.cs, TrimmedSize 0x40)
+// =====================================================================
+
+accessor!(JObj);
+
+impl JObj {
+    pub fn class_name(&self) -> Result<Option<String>> {
+        self.s().get_string(0x00)
+    }
+    pub fn flags(&self) -> Result<JObjFlag> {
+        Ok(JObjFlag::from_bits_retain(self.s().get_u32(0x04)?))
+    }
+    pub fn child(&self) -> Option<JObj> {
+        self.ref_at::<JObj>(0x08)
+    }
+    pub fn next(&self) -> Option<JObj> {
+        self.ref_at::<JObj>(0x0C)
+    }
+    /// `Dobj` only when neither SPLINE nor PTCL flags are set; otherwise the
+    /// reference at 0x10 is a spline / particle joint payload (out of scope
+    /// for Phase 1 — we treat them as "no Dobj" here).
+    pub fn dobj(&self) -> Result<Option<DObj>> {
+        let f = self.flags()?;
+        if f.intersects(JObjFlag::SPLINE | JObjFlag::PTCL) {
+            return Ok(None);
+        }
+        Ok(self.ref_at::<DObj>(0x10))
+    }
+    pub fn rx(&self) -> Result<f32> { self.s().get_f32(0x14) }
+    pub fn ry(&self) -> Result<f32> { self.s().get_f32(0x18) }
+    pub fn rz(&self) -> Result<f32> { self.s().get_f32(0x1C) }
+    pub fn sx(&self) -> Result<f32> { self.s().get_f32(0x20) }
+    pub fn sy(&self) -> Result<f32> { self.s().get_f32(0x24) }
+    pub fn sz(&self) -> Result<f32> { self.s().get_f32(0x28) }
+    pub fn tx(&self) -> Result<f32> { self.s().get_f32(0x2C) }
+    pub fn ty(&self) -> Result<f32> { self.s().get_f32(0x30) }
+    pub fn tz(&self) -> Result<f32> { self.s().get_f32(0x34) }
+}
+
+// =====================================================================
+// DObj  (HSDRaw/Common/HSD_DOBJ.cs, TrimmedSize 0x10)
+// =====================================================================
+
+accessor!(DObj);
+
+impl DObj {
+    pub fn class_name(&self) -> Result<Option<String>> { self.s().get_string(0x00) }
+    pub fn next(&self) -> Option<DObj> { self.ref_at::<DObj>(0x04) }
+    pub fn mobj(&self) -> Option<MObj> { self.ref_at::<MObj>(0x08) }
+    pub fn pobj(&self) -> Option<PObj> { self.ref_at::<PObj>(0x0C) }
+}
+
+// =====================================================================
+// MObj  (HSDRaw/Common/HSD_MOBJ.cs, TrimmedSize 0x18)
+// =====================================================================
+
+accessor!(MObj);
+
+impl MObj {
+    pub fn class_name(&self) -> Result<Option<String>> { self.s().get_string(0x00) }
+    pub fn render_flags(&self) -> Result<MaterialRenderMode> {
+        Ok(MaterialRenderMode::from_bits_retain(self.s().get_u32(0x04)?))
+    }
+    pub fn textures(&self) -> Option<TObj> { self.ref_at::<TObj>(0x08) }
+    pub fn material(&self) -> Option<Material> { self.ref_at::<Material>(0x0C) }
+    pub fn pe_desc(&self) -> Option<PeDesc> { self.ref_at::<PeDesc>(0x14) }
+}
+
+// =====================================================================
+// Material  (HSDRaw/Common/HSD_MOBJ.cs:101, TrimmedSize 0x14)
+// =====================================================================
+
+accessor!(Material);
+
+impl Material {
+    pub fn amb_rgba(&self) -> Result<[u8; 4]> {
+        let s = self.s();
+        Ok([s.get_byte(0x00)?, s.get_byte(0x01)?, s.get_byte(0x02)?, s.get_byte(0x03)?])
+    }
+    pub fn dif_rgba(&self) -> Result<[u8; 4]> {
+        let s = self.s();
+        Ok([s.get_byte(0x04)?, s.get_byte(0x05)?, s.get_byte(0x06)?, s.get_byte(0x07)?])
+    }
+    pub fn spc_rgba(&self) -> Result<[u8; 4]> {
+        let s = self.s();
+        Ok([s.get_byte(0x08)?, s.get_byte(0x09)?, s.get_byte(0x0A)?, s.get_byte(0x0B)?])
+    }
+    pub fn alpha(&self) -> Result<f32> { self.s().get_f32(0x0C) }
+    pub fn shininess(&self) -> Result<f32> { self.s().get_f32(0x10) }
+}
+
+// =====================================================================
+// PeDesc  (HSDRaw/Common/HSD_MOBJ.cs:156, TrimmedSize 0xC)
+// =====================================================================
+
+accessor!(PeDesc);
+
+// =====================================================================
+// PObj  (HSDRaw/Common/HSD_POBJ.cs, TrimmedSize 0x18)
+// =====================================================================
+
+accessor!(PObj);
+
+impl PObj {
+    pub fn class_name(&self) -> Result<Option<String>> { self.s().get_string(0x00) }
+    pub fn next(&self) -> Option<PObj> { self.ref_at::<PObj>(0x04) }
+    pub fn attributes_struct(&self) -> Option<StructRef> { self.s().get_reference(0x08) }
+    pub fn flags(&self) -> Result<PObjFlag> {
+        Ok(PObjFlag::from_bits_retain(self.s().get_u16(0x0C)?))
+    }
+    /// Display list size in bytes (HSDLib stores it in 32-byte units at 0x0E).
+    pub fn display_list_size(&self) -> Result<u32> {
+        Ok(self.s().get_i16(0x0E)? as u32 * 32)
+    }
+    pub fn display_list_buffer(&self) -> Option<Vec<u8>> {
+        self.s().get_reference(0x10).map(|s| s.borrow().data().to_vec())
+    }
+
+    /// The 0x14 slot is a tagged union driven by `Flags`.  Phase 1 only
+    /// needs the SingleBoundJOBJ branch; ShapeSet / EnvelopeWeights are
+    /// stubbed for now.
+    pub fn single_bound_jobj(&self) -> Result<Option<JObj>> {
+        let f = self.flags()?;
+        if f.intersects(PObjFlag::SHAPESET | PObjFlag::ENVELOPE) {
+            return Ok(None);
+        }
+        Ok(self.ref_at::<JObj>(0x14))
+    }
+}
+
+// =====================================================================
+// TObj  (HSDRaw/Common/HSD_TOBJ.cs, TrimmedSize 0x5C)
+// =====================================================================
+
+accessor!(TObj);
+
+impl TObj {
+    pub fn class_name(&self) -> Result<Option<String>> { self.s().get_string(0x00) }
+    pub fn next(&self) -> Option<TObj> { self.ref_at::<TObj>(0x04) }
+    pub fn tex_map_id(&self) -> Result<GxTexMapId> {
+        Ok(GxTexMapId::from(self.s().get_u32(0x08)?))
+    }
+    pub fn rx(&self) -> Result<f32> { self.s().get_f32(0x10) }
+    pub fn ry(&self) -> Result<f32> { self.s().get_f32(0x14) }
+    pub fn rz(&self) -> Result<f32> { self.s().get_f32(0x18) }
+    pub fn sx(&self) -> Result<f32> { self.s().get_f32(0x1C) }
+    pub fn sy(&self) -> Result<f32> { self.s().get_f32(0x20) }
+    pub fn sz(&self) -> Result<f32> { self.s().get_f32(0x24) }
+    pub fn tx(&self) -> Result<f32> { self.s().get_f32(0x28) }
+    pub fn ty(&self) -> Result<f32> { self.s().get_f32(0x2C) }
+    pub fn tz(&self) -> Result<f32> { self.s().get_f32(0x30) }
+    pub fn wrap_s(&self) -> Result<GxWrapMode> {
+        Ok(GxWrapMode::from(self.s().get_u32(0x34)?))
+    }
+    pub fn wrap_t(&self) -> Result<GxWrapMode> {
+        Ok(GxWrapMode::from(self.s().get_u32(0x38)?))
+    }
+    pub fn repeat_s(&self) -> Result<u8> { self.s().get_byte(0x3C) }
+    pub fn repeat_t(&self) -> Result<u8> { self.s().get_byte(0x3D) }
+    pub fn flags(&self) -> Result<TObjFlags> {
+        Ok(TObjFlags::from_bits_retain(self.s().get_u32(0x40)?))
+    }
+    pub fn coord_type(&self) -> Result<CoordType> {
+        Ok(CoordType::from(self.s().get_u32(0x40)? & 0xF))
+    }
+    pub fn color_operation(&self) -> Result<ColorMap> {
+        Ok(ColorMap::from((self.s().get_u32(0x40)? >> 16) & 0xF))
+    }
+    pub fn alpha_operation(&self) -> Result<AlphaMap> {
+        Ok(AlphaMap::from((self.s().get_u32(0x40)? >> 20) & 0xF))
+    }
+    pub fn blending(&self) -> Result<f32> { self.s().get_f32(0x44) }
+    pub fn mag_filter(&self) -> Result<GxTexFilter> {
+        Ok(GxTexFilter::from(self.s().get_u32(0x48)?))
+    }
+    pub fn image_data(&self) -> Option<Image> { self.ref_at::<Image>(0x4C) }
+    pub fn tlut_data(&self) -> Option<Tlut> { self.ref_at::<Tlut>(0x50) }
+}
+
+// =====================================================================
+// Image  (HSDRaw/Common/HSD_TOBJ.cs:341, TrimmedSize 0x18)
+// =====================================================================
+
+accessor!(Image);
+
+impl Image {
+    pub fn image_data(&self) -> Option<Vec<u8>> {
+        self.s().get_reference(0x00).map(|s| s.borrow().data().to_vec())
+    }
+    pub fn width(&self) -> Result<i16> { self.s().get_i16(0x04) }
+    pub fn height(&self) -> Result<i16> { self.s().get_i16(0x06) }
+    pub fn format(&self) -> Result<GxTexFmt> {
+        Ok(GxTexFmt::from(self.s().get_u32(0x08)?))
+    }
+    pub fn mipmap(&self) -> Result<i32> { self.s().get_i32(0x0C) }
+    pub fn min_lod(&self) -> Result<f32> { self.s().get_f32(0x10) }
+    pub fn max_lod(&self) -> Result<f32> { self.s().get_f32(0x14) }
+}
+
+// =====================================================================
+// Tlut  (HSDRaw/Common/HSD_TOBJ.cs:368, TrimmedSize 0x20)
+// =====================================================================
+
+accessor!(Tlut);
+
+impl Tlut {
+    pub fn tlut_data(&self) -> Option<Vec<u8>> {
+        self.s().get_reference(0x00).map(|s| s.borrow().data().to_vec())
+    }
+    pub fn format(&self) -> Result<GxTlutFmt> {
+        Ok(GxTlutFmt::from(self.s().get_u32(0x04)?))
+    }
+    pub fn gx_tlut(&self) -> Result<i32> { self.s().get_i32(0x08) }
+    pub fn color_count(&self) -> Result<i16> { self.s().get_i16(0x0C) }
+}
+
+// =====================================================================
+// SObj  (HSDRaw/Common/HSD_SOBJ.cs:19, TrimmedSize 0x10)
+// =====================================================================
+
+accessor!(SObj);
+
+impl SObj {
+    /// `JOBJDescs` is a `HSDNullPointerArrayAccessor<HSD_JOBJDesc>`: the slot
+    /// at 0x00 references an inline array of refs terminated by a NULL ptr.
+    /// Length is determined by counting non-NULL entries.
+    pub fn jobj_descs(&self) -> Vec<JObjDesc> {
+        let Some(arr) = self.s().get_reference(0x00) else {
+            return Vec::new();
+        };
+        let arr_borrow = arr.borrow();
+        let mut out = Vec::new();
+        let mut i = 0u32;
+        loop {
+            // Each slot is a 4-byte pointer to a HSD_JOBJDesc struct (or 0 to
+            // terminate).  In our model the references map holds the resolved
+            // child; absence at offset i*4 ends the array.
+            match arr_borrow.get_reference(i * 4) {
+                Some(child) => out.push(JObjDesc(child)),
+                None => break,
+            }
+            i += 1;
+        }
+        out
+    }
+}
+
+// =====================================================================
+// JObjDesc  (HSDRaw/Common/HSD_SOBJ.cs:35, TrimmedSize 0x10)
+// =====================================================================
+
+accessor!(JObjDesc);
+
+impl JObjDesc {
+    pub fn root_joint(&self) -> Option<JObj> {
+        self.ref_at::<JObj>(0x00)
+    }
+    // Anim slots (0x04..0x0C) intentionally not exposed yet.
+}

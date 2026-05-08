@@ -1,14 +1,18 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! hsdraw-core — pure-Rust HSD `.dat` reader/writer.
+//!
+//! Phase scope: Reader (header, relocation table, struct identity, JObj tree
+//! walk).  GX texture decode, DL unpack, writer, alias-root round-trip are
+//! built on top in later phases.  See `docs/notes/phase0.md` for the spec the
+//! whole crate is built against.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod accessor;
+pub mod common;
+pub mod dat;
+pub mod error;
+pub mod gx;
+pub mod hsd_struct;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use accessor::Accessor;
+pub use dat::Dat;
+pub use error::{HsdError, Result};
+pub use hsd_struct::{HsdStruct, StructRef};

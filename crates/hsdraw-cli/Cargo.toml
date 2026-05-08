@@ -10,6 +10,8 @@ name = "hsdraw-cli"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
 hsdraw-core = { path = "../hsdraw-core" }
 
 [lints]

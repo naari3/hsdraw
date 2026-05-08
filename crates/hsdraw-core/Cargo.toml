@@ -7,7 +7,10 @@ version.workspace = true
 
 [dependencies]
 byteorder = "1.5.0"
+hex = "0.4.3"
 indexmap = "2.14.0"
+png = "0.18.1"
+sha1 = "0.11.0"
 thiserror = "2.0.18"
 
 [lints]

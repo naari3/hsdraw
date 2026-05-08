@@ -10,6 +10,7 @@ pub mod common;
 pub mod dat;
 pub mod error;
 pub mod gx;
+pub mod gx_image;
 pub mod hsd_struct;
 
 pub use accessor::Accessor;

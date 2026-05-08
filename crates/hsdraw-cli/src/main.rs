@@ -3,9 +3,9 @@
 //! `mkgp2-patch/tools/hsd/hsd_dump.csx`.  Future phases extend this with
 //! `--json out/`, texture export, etc.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -13,6 +13,7 @@ use hsdraw_core::accessor::{Accessor, id_of};
 use hsdraw_core::common::{DObj, JObj, MObj, PObj, SObj, TObj};
 use hsdraw_core::error::HsdError;
 use hsdraw_core::gx::{jobj_flag_names, render_flag_names};
+use hsdraw_core::gx_image;
 use hsdraw_core::Dat;
 
 #[derive(Parser, Debug)]
@@ -24,20 +25,25 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Parse a .dat and print a JObj/DObj tree dump to stdout.
+    /// Parse a .dat and print a JObj/DObj tree dump to stdout.  When
+    /// `--out` is given, texture data is decoded and written as
+    /// `<out>/tex/<sha1>.png` next to a future `scene.json` (Phase 4).
     Decode {
         dat: PathBuf,
+        /// Output directory for the JSON+PNG bundle.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Decode { dat } => decode(&dat),
+        Command::Decode { dat, out } => decode(&dat, out.as_deref()),
     }
 }
 
-fn decode(path: &PathBuf) -> Result<()> {
+fn decode(path: &PathBuf, out: Option<&Path>) -> Result<()> {
     let bytes = fs::read(path)
         .with_context(|| format!("read {}", path.display()))?;
     let dat = Dat::parse(&bytes)
@@ -52,6 +58,17 @@ fn decode(path: &PathBuf) -> Result<()> {
     println!("Roots: {}", dat.roots.len());
     println!("References: {}", dat.references.len());
     println!("Structs: {}", dat.struct_order.len());
+
+    let tex_dir = match out {
+        Some(o) => {
+            let d = o.join("tex");
+            fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
+            Some(d)
+        }
+        None => None,
+    };
+
+    let mut tex_state = TextureExport::new(tex_dir);
     println!();
 
     let mut visited: HashSet<*const std::cell::RefCell<hsdraw_core::HsdStruct>> = HashSet::new();
@@ -76,12 +93,24 @@ fn decode(path: &PathBuf) -> Result<()> {
             for (i, desc) in sobj.jobj_descs().into_iter().enumerate() {
                 println!("  JOBJDesc[{}]:", i);
                 if let Some(rj) = desc.root_joint() {
-                    walk_jobj(&rj, 2, &mut jobj_counter, &mut visited)?;
+                    walk_jobj(
+                        &rj,
+                        2,
+                        &mut jobj_counter,
+                        &mut visited,
+                        &mut tex_state,
+                    )?;
                 }
             }
         } else if is_jobj_root {
             let jobj = JObj::from_struct(root.data.clone());
-            walk_jobj(&jobj, 1, &mut jobj_counter, &mut visited)?;
+            walk_jobj(
+                &jobj,
+                1,
+                &mut jobj_counter,
+                &mut visited,
+                &mut tex_state,
+            )?;
         } else {
             println!("  (unrecognized root kind, skipping body dump)");
         }
@@ -89,7 +118,144 @@ fn decode(path: &PathBuf) -> Result<()> {
         println!();
     }
 
+    if let Some(stats) = tex_state.finish()? {
+        println!(
+            "Textures: {} unique (skipped {} dup, errors {})",
+            stats.unique, stats.duplicates, stats.errors
+        );
+    }
+
     Ok(())
+}
+
+/// Tracks dedup of textures by SHA-1 of the *encoded* GX byte buffer (not
+/// the decoded RGBA), matching csx so the resulting PNG file names are the
+/// same on both sides.
+struct TextureExport {
+    tex_dir: Option<PathBuf>,
+    sha_seen: HashMap<String, ()>,
+    unique: usize,
+    duplicates: usize,
+    errors: usize,
+}
+
+#[derive(Debug)]
+struct TextureExportStats {
+    unique: usize,
+    duplicates: usize,
+    errors: usize,
+}
+
+impl TextureExport {
+    fn new(tex_dir: Option<PathBuf>) -> Self {
+        Self {
+            tex_dir,
+            sha_seen: HashMap::new(),
+            unique: 0,
+            duplicates: 0,
+            errors: 0,
+        }
+    }
+
+    /// Returns the 12-hex-char id (matches csx `Sha1(...).Substring(0, 12)`).
+    fn intern(&mut self, tobj: &TObj) -> Option<String> {
+        let img = tobj.image_data()?;
+        let raw = img.image_data()?;
+        if raw.is_empty() {
+            return None;
+        }
+        let sha = sha1_short_id(&raw);
+
+        // Skip if we've seen this exact encoded buffer before.
+        if self.sha_seen.contains_key(&sha) {
+            self.duplicates += 1;
+            return Some(sha);
+        }
+
+        if let Some(dir) = &self.tex_dir {
+            let w = match img.width() {
+                Ok(v) if v > 0 => v as u32,
+                _ => {
+                    self.errors += 1;
+                    return None;
+                }
+            };
+            let h = match img.height() {
+                Ok(v) if v > 0 => v as u32,
+                _ => {
+                    self.errors += 1;
+                    return None;
+                }
+            };
+            let fmt = match img.format() {
+                Ok(f) => f,
+                Err(_) => {
+                    self.errors += 1;
+                    return None;
+                }
+            };
+
+            let palette = tobj.tlut_data().and_then(|t| {
+                let bytes = t.tlut_data()?;
+                let f = t.format().ok()?;
+                Some((f, bytes))
+            });
+            let palette_ref = palette.as_ref().map(|(f, b)| (*f, b.as_slice()));
+
+            match gx_image::decode_image(fmt, w, h, &raw, palette_ref) {
+                Ok(rgba) => match gx_image::encode_png(&rgba, w, h) {
+                    Ok(png) => {
+                        let path = dir.join(format!("{}.png", sha));
+                        if let Err(e) = fs::write(&path, &png) {
+                            eprintln!("  WARN: write {} failed: {}", path.display(), e);
+                            self.errors += 1;
+                            return None;
+                        }
+                        self.unique += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  WARN: png encode failed for {}: {:?}", sha, e);
+                        self.errors += 1;
+                        return None;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("  WARN: decode failed for {} ({:?}): {:?}", sha, fmt, e);
+                    self.errors += 1;
+                    return None;
+                }
+            }
+        } else {
+            self.unique += 1;
+        }
+
+        self.sha_seen.insert(sha.clone(), ());
+        Some(sha)
+    }
+
+    fn finish(self) -> Result<Option<TextureExportStats>> {
+        if self.tex_dir.is_none() && self.unique == 0 && self.duplicates == 0 && self.errors == 0 {
+            return Ok(None);
+        }
+        Ok(Some(TextureExportStats {
+            unique: self.unique,
+            duplicates: self.duplicates,
+            errors: self.errors,
+        }))
+    }
+}
+
+fn sha1_short_id(data: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let hash = Sha1::digest(data);
+    // csx: `BitConverter.ToString(hash).Replace("-","").Substring(0,12)`
+    // → first 12 hex chars, uppercase.
+    let mut s = String::with_capacity(12);
+    for b in &hash[..6] {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{:02X}", b);
+    }
+    s
 }
 
 fn walk_jobj(
@@ -97,6 +263,7 @@ fn walk_jobj(
     depth: usize,
     counter: &mut u32,
     visited: &mut HashSet<*const std::cell::RefCell<hsdraw_core::HsdStruct>>,
+    tex: &mut TextureExport,
 ) -> std::result::Result<(), HsdError> {
     // Iterate the linked Next chain at this level; recurse into Child.
     let mut cur = Some(j.clone());
@@ -126,11 +293,11 @@ fn walk_jobj(
         if !already {
             // DObjs
             if let Some(d) = jobj.dobj()? {
-                walk_dobj(&d, depth + 1)?;
+                walk_dobj(&d, depth + 1, tex)?;
             }
             // recurse into Child subtree
             if let Some(child) = jobj.child() {
-                walk_jobj(&child, depth + 1, counter, visited)?;
+                walk_jobj(&child, depth + 1, counter, visited, tex)?;
             }
         }
 
@@ -139,7 +306,7 @@ fn walk_jobj(
     Ok(())
 }
 
-fn walk_dobj(d: &DObj, depth: usize) -> std::result::Result<(), HsdError> {
+fn walk_dobj(d: &DObj, depth: usize, tex: &mut TextureExport) -> std::result::Result<(), HsdError> {
     let mut cur = Some(d.clone());
     let mut idx = 0;
     while let Some(dobj) = cur {
@@ -150,7 +317,7 @@ fn walk_dobj(d: &DObj, depth: usize) -> std::result::Result<(), HsdError> {
             dobj.class_name()?.unwrap_or_default()
         );
         if let Some(m) = dobj.mobj() {
-            walk_mobj(&m, depth + 1)?;
+            walk_mobj(&m, depth + 1, tex)?;
         }
         if let Some(p) = dobj.pobj() {
             walk_pobj(&p, depth + 1)?;
@@ -161,7 +328,7 @@ fn walk_dobj(d: &DObj, depth: usize) -> std::result::Result<(), HsdError> {
     Ok(())
 }
 
-fn walk_mobj(m: &MObj, depth: usize) -> std::result::Result<(), HsdError> {
+fn walk_mobj(m: &MObj, depth: usize, tex: &mut TextureExport) -> std::result::Result<(), HsdError> {
     let prefix = "  ".repeat(depth);
     let flags = m.render_flags()?;
     println!(
@@ -179,12 +346,12 @@ fn walk_mobj(m: &MObj, depth: usize) -> std::result::Result<(), HsdError> {
         );
     }
     if let Some(t) = m.textures() {
-        walk_tobj(&t, depth + 1)?;
+        walk_tobj(&t, depth + 1, tex)?;
     }
     Ok(())
 }
 
-fn walk_tobj(t: &TObj, depth: usize) -> std::result::Result<(), HsdError> {
+fn walk_tobj(t: &TObj, depth: usize, tex: &mut TextureExport) -> std::result::Result<(), HsdError> {
     let mut cur = Some(t.clone());
     let mut idx = 0;
     while let Some(tobj) = cur {
@@ -195,14 +362,16 @@ fn walk_tobj(t: &TObj, depth: usize) -> std::result::Result<(), HsdError> {
         } else {
             (0, 0, "<no image>".to_owned())
         };
+        let sha = tex.intern(&tobj).unwrap_or_default();
         println!(
-            "{}TObj#{} TexMap={:?} Wrap=(S:{:?}, T:{:?}) ColorOp={:?} AlphaOp={:?} Blending={:.3} {}x{} {}",
+            "{}TObj#{} TexMap={:?} Wrap=(S:{:?}, T:{:?}) ColorOp={:?} AlphaOp={:?} Blending={:.3} {}x{} {} sha={}",
             prefix, idx,
             tobj.tex_map_id()?,
             tobj.wrap_s()?, tobj.wrap_t()?,
             tobj.color_operation()?, tobj.alpha_operation()?,
             tobj.blending()?,
             w, h, fmt,
+            sha,
         );
         cur = tobj.next();
         idx += 1;

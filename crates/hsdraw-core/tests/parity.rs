@@ -340,12 +340,18 @@ fn json_diff_recognizes_eps() {
 
 #[test]
 fn rust_export_runs_on_synthetic() {
-    // `tests/data/synthetic_minimal.dat` is committed to the repo so the CI
-    // gate doesn't depend on the vanilla MKGP2 corpus.  Until Phase 5 ships
-    // the writer, we generate the synthetic fixture in-place from the same
-    // hand-crafted byte literal used by `dat::tests::parses_minimal_dat`.
-    let synthetic = make_synthetic_minimal();
-    let dat = Dat::parse(&synthetic).expect("parse synthetic");
+    // `tests/data/synthetic_minimal.dat` is the committed Phase 5 fixture
+    // (regenerate via `cargo run -p hsdraw-cli --example gen_synthetic`).
+    // It's the writer's canonical-form output for the smallest possible
+    // valid .dat (one root pointing at one zero-filled struct), so this
+    // test exercises both reader + writer in the CI gate without
+    // depending on the vanilla MKGP2 corpus.
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("data")
+        .join("synthetic_minimal.dat");
+    let bytes = std::fs::read(&fixture).expect("synthetic fixture present");
+    let dat = Dat::parse(&bytes).expect("parse synthetic");
     assert_eq!(dat.roots.len(), 1);
     assert_eq!(dat.roots[0].name, "scene_data");
 
@@ -353,6 +359,13 @@ fn rust_export_runs_on_synthetic() {
     let scene = export::export_scene(&dat, "synthetic_minimal.dat", None)
         .expect("export ok");
     assert_eq!(scene.source_dat, "synthetic_minimal.dat");
+
+    // Writer round-trip: re-parsing the writer's output of this fixture
+    // must yield the same root structure (one root named scene_data).
+    let written = dat.write().expect("write");
+    let dat2 = Dat::parse(&written).expect("reparse written");
+    assert_eq!(dat2.roots.len(), 1);
+    assert_eq!(dat2.roots[0].name, "scene_data");
 }
 
 #[test]
@@ -425,23 +438,106 @@ fn vanilla_corpus_round_trips() {
     }
 }
 
-// =====================================================================
-// Synthetic minimal .dat (≈0x48 bytes) — same hand-crafted file used in the
-// dat parser unit test.  Lives in test code rather than as a checked-in
-// binary while Phase 5 / the writer is pending.
-// =====================================================================
+/// Writer round-trip: `parse → write → parse` should produce a Dat whose
+/// `scene.json` matches the original's exactly.  Bytes don't have to match;
+/// HSDLib's own Save isn't byte-deterministic across reloc orderings either.
+///
+/// The `*_set.dat` rosters carry the alias-root pattern described in
+/// `mkgp2docs/hsd_alias_and_blender_pipeline.md` — multiple root symbols
+/// that resolve to JObj structs already living inside the SOBJ tree.  We
+/// verify alias topology survives a write-out: every (root_j, sub_struct)
+/// identity match in the original is still observable after the round trip.
+#[test]
+fn vanilla_corpus_writer_round_trips() {
+    if mkgp2_files_dir().is_none() {
+        eprintln!("skipped: MKGP2_FILES_DIR not set");
+        return;
+    }
+    let files_dir = mkgp2_files_dir().unwrap();
+    let target_files = [
+        "test_course_start_gate.dat",
+        "MR_highway_short_A.dat",
+        "MR_highway_long_A.dat",
+        "DK_jungle_short_a.dat",
+        "DK_jungle_long_a.dat",
+        "AT_demo.dat",
+        // alias-root rich fixtures (12+ alias roots each)
+        "waluigi_set.dat",
+        "yoshi_set.dat",
+        "wario_set.dat",
+    ];
 
-fn make_synthetic_minimal() -> Vec<u8> {
-    use byteorder::{BigEndian, ByteOrder};
-    let mut buf = vec![0u8; 0x48];
-    BigEndian::write_u32(&mut buf[0x00..0x04], 0x48); // fsize
-    BigEndian::write_u32(&mut buf[0x04..0x08], 0x10); // reloc_offset_rel
-    BigEndian::write_u32(&mut buf[0x08..0x0C], 0x00); // reloc_count
-    BigEndian::write_u32(&mut buf[0x0C..0x10], 0x01); // root_count
-    BigEndian::write_u32(&mut buf[0x10..0x14], 0x00); // ref_count
-    BigEndian::write_u32(&mut buf[0x30..0x34], 0x00); // root data_rel
-    BigEndian::write_u32(&mut buf[0x34..0x38], 0x00); // root str_rel
-    let name = b"scene_data\0";
-    buf[0x38..0x38 + name.len()].copy_from_slice(name);
-    buf
+    for name in target_files {
+        let dat_path = files_dir.join(name);
+        if !dat_path.exists() {
+            eprintln!("  [skip] {} not present", name);
+            continue;
+        }
+        let bytes = std::fs::read(&dat_path).expect("read original");
+        let dat0 = Dat::parse(&bytes).expect("parse 1");
+        let scene0 = export::export_scene(&dat0, name, None).expect("export 1");
+        let alias0 = alias_topology(&dat0);
+        let written = dat0.write().expect("write");
+
+        let dat1 = Dat::parse(&written).expect("parse 2 (written file)");
+        let scene1 = export::export_scene(&dat1, name, None).expect("export 2");
+        let alias1 = alias_topology(&dat1);
+
+        let v0: Value = serde_json::to_value(&scene0).expect("scene0 → json");
+        let v1: Value = serde_json::to_value(&scene1).expect("scene1 → json");
+        diff_json(&v0, &v1, "").unwrap_or_else(|JsonDiff(msg)| {
+            panic!("{}: writer round-trip scene.json drift: {}", name, msg)
+        });
+
+        if alias0 != alias1 {
+            panic!(
+                "{}: alias topology drifted on round-trip\n  before: {:?}\n  after:  {:?}",
+                name, alias0, alias1
+            );
+        }
+        eprintln!(
+            "  ✓ {} writer round-trip OK ({} alias roots)",
+            name,
+            alias0.len()
+        );
+    }
 }
+
+/// For each root index `j`, the set of root indices `i` (i ≠ j) such that
+/// `roots[j].data` is reachable as a sub-struct of `roots[i].data`.
+/// Identity ordering is canonicalized (sorted) so the comparison ignores
+/// hash-iteration randomness.  Empty set means "not aliased to any other
+/// root's tree".
+fn alias_topology(dat: &Dat) -> Vec<(usize, Vec<usize>)> {
+    use std::collections::HashSet;
+    use std::rc::Rc;
+    let per_root_subs: Vec<HashSet<*const _>> = dat
+        .roots
+        .iter()
+        .map(|r| {
+            hsdraw_core::hsd_struct::collect_substructs(&r.data)
+                .iter()
+                .map(Rc::as_ptr)
+                .collect()
+        })
+        .collect();
+    let mut out = Vec::with_capacity(dat.roots.len());
+    for (j, rj) in dat.roots.iter().enumerate() {
+        let pj = Rc::as_ptr(&rj.data);
+        let mut hits: Vec<usize> = per_root_subs
+            .iter()
+            .enumerate()
+            .filter(|(i, subs)| *i != j && subs.contains(&pj))
+            .map(|(i, _)| i)
+            .collect();
+        hits.sort();
+        if !hits.is_empty() {
+            out.push((j, hits));
+        }
+    }
+    out
+}
+
+// (No need for an in-memory `make_synthetic_minimal` anymore — the fixture
+// is committed at `tests/data/synthetic_minimal.dat`.  Regenerate with the
+// `gen_synthetic` example if the reader / writer's canonical form changes.)

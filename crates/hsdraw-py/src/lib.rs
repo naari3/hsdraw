@@ -93,11 +93,36 @@ fn export_scene_json(
         .map_err(|e| PyIOError::new_err(format!("serialize scene: {}", e)))
 }
 
+/// Round-trip parse + write.  Returns freshly-serialized .dat bytes.
+///
+/// `optimize` (default True): drop unreachable structs and dedup byte-equal
+/// buffer payloads.  `buffer_align` (default True): 0x20-align structs the
+/// writer marks as buffers.  Disable both for byte-faithful debugging.
+#[pyfunction]
+#[pyo3(signature = (data, /, optimize=true, buffer_align=true))]
+fn write_dat<'py>(
+    py: Python<'py>,
+    data: &Bound<'_, PyBytes>,
+    optimize: bool,
+    buffer_align: bool,
+) -> PyResult<Bound<'py, PyBytes>> {
+    use hsdraw_core::writer::WriteOptions;
+    let bytes = data.as_bytes();
+    let parsed = CoreDat::parse(bytes)
+        .map_err(|e| PyValueError::new_err(format!("parse_dat: {:?}", e)))?;
+    let opts = WriteOptions { optimize, buffer_align, trim: false };
+    let out = parsed
+        .write_with_options(opts)
+        .map_err(|e| PyValueError::new_err(format!("write_dat: {:?}", e)))?;
+    Ok(PyBytes::new(py, &out))
+}
+
 #[pymodule]
 fn hsdraw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(parse_dat, m)?)?;
     m.add_function(wrap_pyfunction!(export_scene_json, m)?)?;
+    m.add_function(wrap_pyfunction!(write_dat, m)?)?;
     m.add_class::<PyDat>()?;
     Ok(())
 }

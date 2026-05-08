@@ -36,13 +36,57 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// `parse → write`: read a .dat and emit a freshly-serialized .dat at
+    /// `--out`.  Useful as a smoke test for the writer (Phase 5) and as a
+    /// debugging tool: comparing input vs output sizes / reloc counts often
+    /// surfaces issues quickly.
+    Encode {
+        dat: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Disable buffer dedup + unreachable struct removal.
+        #[arg(long, default_value_t = false)]
+        no_optimize: bool,
+        /// Disable 0x20 alignment for buffers (textures will likely break).
+        #[arg(long, default_value_t = false)]
+        no_buffer_align: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Decode { dat, out } => decode(&dat, out.as_deref()),
+        Command::Encode { dat, out, no_optimize, no_buffer_align } => {
+            encode(&dat, &out, no_optimize, no_buffer_align)
+        }
     }
+}
+
+fn encode(path: &PathBuf, out: &PathBuf, no_optimize: bool, no_buffer_align: bool) -> Result<()> {
+    use hsdraw_core::writer::WriteOptions;
+    let bytes = fs::read(path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let dat = Dat::parse(&bytes)
+        .with_context(|| format!("parse {}", path.display()))?;
+
+    let opts = WriteOptions {
+        optimize: !no_optimize,
+        buffer_align: !no_buffer_align,
+        trim: false,
+    };
+    let written = dat
+        .write_with_options(opts)
+        .with_context(|| "write failed")?;
+    fs::write(out, &written)
+        .with_context(|| format!("write {}", out.display()))?;
+    println!(
+        "Wrote: {} ({} bytes; original {} bytes)",
+        out.display(),
+        written.len(),
+        bytes.len()
+    );
+    Ok(())
 }
 
 fn decode(path: &PathBuf, out: Option<&Path>) -> Result<()> {

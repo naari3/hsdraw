@@ -1,0 +1,78 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Avoid stacking redundant runs on rapid pushes / force-pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Phase 4 / handoff completion-criterion: parity gate green on all
+        # three OS.  We don't bring the MKGP2 corpus into CI (it's not
+        # redistributable), so `vanilla_corpus_*` skips itself via the
+        # MKGP2_FILES_DIR env-var check.  The synthetic fixture covers
+        # both reader and writer in their canonical form.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --workspace --all-targets
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      # clippy is informational for now (Phase 5 leaves a handful of style
+      # warnings).  When we tighten lints in Phase 6, switch this to
+      # `-D warnings` and gate the job on it.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+
+  # Build the Python wheel locally on each OS to make sure the PyO3 binding
+  # crate compiles outside of cibuildwheel's docker image.  The actual
+  # cross-platform wheels we ship come from `wheels.yml`.
+  wheel-smoke:
+    name: maturin develop smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install maturin
+        run: pip install --upgrade pip maturin
+
+      - name: build wheel
+        working-directory: crates/hsdraw-py
+        run: maturin build --release --features pyo3/extension-module
+
+      - name: import smoke
+        shell: bash
+        working-directory: crates/hsdraw-py
+        run: |
+          # Pick the freshly-built wheel; abi3 means there should be exactly
+          # one for this platform.
+          wheel=$(ls ../../target/wheels/hsdraw-*.whl | head -1)
+          echo "Installing $wheel"
+          pip install "$wheel"
+          python -c "import hsdraw; print('version:', hsdraw.version()); assert callable(hsdraw.parse_dat); assert callable(hsdraw.write_dat); assert callable(hsdraw.export_scene_json)"

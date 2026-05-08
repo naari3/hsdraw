@@ -1,0 +1,117 @@
+name: wheels
+
+# Build cross-platform wheels for the `hsdraw` PyO3 module and upload them
+# as a CI artifact.  Triggers:
+#   - manual dispatch (use this to grab wheels for a Blender add-on bundle
+#     without cutting a tag)
+#   - tag pushes matching v*.*.*  (release pipeline)
+#   - PRs that touch the wheel build itself (catch packaging breakage early)
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/wheels.yml'
+      - 'crates/hsdraw-py/**'
+      - 'crates/hsdraw-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+# Wheels are fully determined by the source tree + tag — no need to keep
+# concurrent runs around for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheels:
+    name: ${{ matrix.target }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 6-platform matrix from docs/handoff.md "完了条件":
+          #   linux x86_64 / aarch64, macos x86_64 / arm64, windows x86_64.
+          # We use abi3-py37 so a single wheel covers Python 3.7+.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, tag: linux-x86_64 }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, tag: linux-aarch64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, tag: macos-x86_64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, tag: macos-arm64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, tag: windows-x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      # PyO3 needs a real Python on the build host (even when cross-
+      # compiling; maturin uses it for ABI introspection).  Match what
+      # cibuildwheel ships.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wheels-${{ matrix.target }}
+
+      - name: install maturin
+        run: pip install --upgrade pip maturin
+
+      # On Linux we delegate manylinux container handling to maturin's
+      # built-in zig-based cross-compilation; on macOS/Windows we use the
+      # native toolchain.  ABI3 means each entry produces exactly 1 wheel.
+      - name: build wheel (linux)
+        if: runner.os == 'Linux'
+        working-directory: crates/hsdraw-py
+        run: |
+          maturin build --release \
+            --target ${{ matrix.target }} \
+            --zig \
+            --features pyo3/extension-module \
+            --out ../../target/wheels
+
+      - name: build wheel (macos / windows)
+        if: runner.os != 'Linux'
+        working-directory: crates/hsdraw-py
+        run: |
+          maturin build --release \
+            --target ${{ matrix.target }} \
+            --features pyo3/extension-module \
+            --out ../../target/wheels
+        shell: bash
+
+      - name: list wheels
+        shell: bash
+        run: ls -la target/wheels/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hsdraw-wheel-${{ matrix.tag }}
+          path: target/wheels/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+  # Aggregate every per-platform artifact under one bundle so consumers
+  # (most notably the mkgp2-patch Blender add-on bundling step) can grab
+  # the whole 6-wheel set in one download.
+  bundle:
+    name: collect wheel bundle
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hsdraw-wheel-*
+          path: wheels/
+          merge-multiple: true
+      - run: ls -la wheels/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hsdraw-wheels-bundle
+          path: wheels/*.whl
+          if-no-files-found: error
+          retention-days: 90

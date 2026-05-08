@@ -9,8 +9,14 @@ dependency and make `import hsdraw` from Blender-bundled CPython work.
 
 ## Status
 
-Pre-Phase 0. See `docs/handoff.md` for the full design spec / scope / parity
-test requirements.
+Phase 0–6 implemented. See `docs/handoff.md` for the original design spec
+and `docs/notes/phaseN.md` for per-phase notes.
+
+- Reader (parse + walk JObj/DObj/MObj/POBJ tree, GX texture decode, DL unpack)
+- Writer (HSDLib `Save`-compatible, alias-root round-trip on 9-file corpus)
+- csx parity gate (`MKGP2_FILES_DIR`+`MKGP2_PATCH_DIR` env, 6 vanilla courses)
+- PyO3 binding (`hsdraw.parse_dat` / `write_dat` / `export_scene_json`)
+- GitHub Actions: cargo test on 3 OS + cibuildwheel-style 5-platform wheels
 
 ## Layout
 
@@ -28,24 +34,41 @@ tests/
 
 ```bash
 cargo check --workspace
-cargo build --release -p hsdraw-cli
+cargo build --release -p hsdraw-cli                # binary at target/release/hsdraw-cli
 ```
 
 For the Python wheel:
 
 ```bash
-cargo install maturin
-maturin develop -m crates/hsdraw-py/Cargo.toml   # local install into venv
-maturin build --release -m crates/hsdraw-py/Cargo.toml --features pyo3/abi3-py37
+python -m venv .venv && source .venv/bin/activate  # (or .venv\Scripts\Activate.ps1)
+pip install maturin
+maturin develop --release -m crates/hsdraw-py/Cargo.toml
+python -c "import hsdraw; print(hsdraw.version())"
 ```
+
+Cross-platform wheels are built by `.github/workflows/wheels.yml` for
+linux x86_64 / aarch64, macos x86_64 / arm64, and windows x86_64.  Trigger
+manually via *Actions → wheels → Run workflow*, or push a `v*` tag.
 
 ## Test
 
 ```bash
-cargo test --workspace
-cargo test --test parity                           # synthetic corpus, CI gate
-MKGP2_FILES_DIR=/path/to/mkgp2/files \
-  cargo test --test parity -- --ignored            # vanilla MKGP2 corpus
+cargo test --workspace                              # unit tests + synthetic gate
+MKGP2_PATCH_DIR=/path/to/mkgp2-patch \
+MKGP2_FILES_DIR="/path/to/mkgp2/files" \
+  cargo test --test parity -- --nocapture          # full csx + writer round-trip
+```
+
+The first form is what CI runs; the second adds csx-vs-Rust parity diff and
+writer round-trip across the vanilla MKGP2 corpus (requires `dotnet-script`
+on PATH and the env-vars to point at a local mkgp2-patch checkout + a
+directory holding extracted .dat files).
+
+## CLI
+
+```bash
+hsdraw-cli decode foo.dat --out out/                # → out/scene.json + out/tex/*.png
+hsdraw-cli encode foo.dat --out foo_rewritten.dat   # parse → write smoke
 ```
 
 ## License

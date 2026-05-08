@@ -9,10 +9,14 @@ pub enum HsdError {
 
     /// Header / relocation table read past EOF or pointed at an impossible
     /// offset.  Carries enough context to find the bad byte in a hex viewer.
+    /// `context` is owned so callers can format runtime values into it
+    /// (e.g. `format!("alias '{}' refs unknown joint", name)` from the
+    /// importer).  Use `HsdError::malformed` for static messages —
+    /// constructing the variant directly works for dynamic ones.
     #[error("malformed dat at offset 0x{offset:X}: {context}")]
     Malformed {
         offset: u64,
-        context: &'static str,
+        context: std::borrow::Cow<'static, str>,
     },
 
     #[error("read past struct end: requested 0x{requested:X} bytes at offset 0x{at:X}, struct length 0x{len:X}")]
@@ -31,7 +35,7 @@ pub enum HsdError {
 }
 
 impl HsdError {
-    pub fn malformed(offset: u64, context: &'static str) -> Self {
-        Self::Malformed { offset, context }
+    pub fn malformed(offset: u64, context: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self::Malformed { offset, context: context.into() }
     }
 }

@@ -51,6 +51,23 @@ enum Command {
         #[arg(long, default_value_t = false)]
         no_buffer_align: bool,
     },
+    /// Apply a `scene.json` mutation set onto a base .dat and write the
+    /// result.  Equivalent to running
+    /// `mkgp2-patch/tools/hsd/hsd_import_from_blender.csx` on the same
+    /// inputs (Pass 0–4: alias add/remove/repoint, TRS+flag sync,
+    /// hierarchy rewire, new joint allocation).  Geometry / materials /
+    /// textures are not re-encoded.
+    Import {
+        /// Base .dat to mutate.  Provides every struct that isn't being
+        /// edited (mesh DLs, materials, textures, …).
+        base: PathBuf,
+        /// Bundle directory containing `scene.json` (and a `tex/` dir,
+        /// not consumed in this MVP).  Mirrors the csx CLI shape.
+        bundle_dir: PathBuf,
+        /// Where to write the freshly-serialized .dat.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -60,7 +77,33 @@ fn main() -> Result<()> {
         Command::Encode { dat, out, no_optimize, no_buffer_align } => {
             encode(&dat, &out, no_optimize, no_buffer_align)
         }
+        Command::Import { base, bundle_dir, out } => {
+            import(&base, &bundle_dir, &out)
+        }
     }
+}
+
+fn import(base: &PathBuf, bundle_dir: &PathBuf, out: &PathBuf) -> Result<()> {
+    use hsdraw_core::import::import_from_scene_json;
+    let scene_path = bundle_dir.join("scene.json");
+    let base_bytes = fs::read(base)
+        .with_context(|| format!("read {}", base.display()))?;
+    let scene_bytes = fs::read(&scene_path)
+        .with_context(|| format!("read {}", scene_path.display()))?;
+    let (out_bytes, stats) = import_from_scene_json(&base_bytes, &scene_bytes)
+        .with_context(|| "import_from_scene_json")?;
+    fs::write(out, &out_bytes)
+        .with_context(|| format!("write {}", out.display()))?;
+    println!(
+        "Wrote: {} ({} bytes; base {} bytes)\n  joints walked={} new={} \n  aliases added={} repointed={} removed={}\n  trs-changed={} flags-changed={} hierarchy-rewired={}",
+        out.display(),
+        out_bytes.len(),
+        base_bytes.len(),
+        stats.joints_walked, stats.new_joints,
+        stats.aliases_added, stats.aliases_repointed, stats.aliases_removed,
+        stats.trs_changed, stats.flags_changed, stats.hierarchy_rewired,
+    );
+    Ok(())
 }
 
 fn encode(path: &PathBuf, out: &PathBuf, no_optimize: bool, no_buffer_align: bool) -> Result<()> {

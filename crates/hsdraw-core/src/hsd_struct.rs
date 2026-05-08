@@ -193,6 +193,54 @@ impl HsdStruct {
         Ok(BigEndian::read_f32(self.get_bytes(offset, 4)?))
     }
 
+    // ------------------------------------------------------------------
+    // Big-endian primitive *setters*.  These mutate the underlying byte
+    // buffer in place; callers borrow the cell mutably (the accessor
+    // wrappers in `common.rs` arrange that).  Out-of-bounds writes are
+    // an error rather than a panic so a buggy import doesn't corrupt the
+    // file silently.
+    // ------------------------------------------------------------------
+
+    fn put_bytes(&mut self, offset: u32, src: &[u8]) -> Result<()> {
+        let start = offset as usize;
+        let end = start
+            .checked_add(src.len())
+            .ok_or(HsdError::StructOob {
+                at: offset,
+                requested: src.len() as u32,
+                len: self.data.len() as u32,
+            })?;
+        if end > self.data.len() {
+            return Err(HsdError::StructOob {
+                at: offset,
+                requested: src.len() as u32,
+                len: self.data.len() as u32,
+            });
+        }
+        self.data[start..end].copy_from_slice(src);
+        Ok(())
+    }
+
+    pub fn set_u16(&mut self, offset: u32, value: u16) -> Result<()> {
+        self.put_bytes(offset, &value.to_be_bytes())
+    }
+
+    pub fn set_i16(&mut self, offset: u32, value: i16) -> Result<()> {
+        self.put_bytes(offset, &value.to_be_bytes())
+    }
+
+    pub fn set_u32(&mut self, offset: u32, value: u32) -> Result<()> {
+        self.put_bytes(offset, &value.to_be_bytes())
+    }
+
+    pub fn set_i32(&mut self, offset: u32, value: i32) -> Result<()> {
+        self.put_bytes(offset, &value.to_be_bytes())
+    }
+
+    pub fn set_f32(&mut self, offset: u32, value: f32) -> Result<()> {
+        self.put_bytes(offset, &value.to_be_bytes())
+    }
+
     /// Read a NUL-terminated UTF-8 string from a referenced sub-struct's data
     /// buffer.  Returns `None` if no reference is set at `offset` (matches
     /// HSDLib `GetString` returning null).

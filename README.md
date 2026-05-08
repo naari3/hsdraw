@@ -9,8 +9,10 @@ dependency and make `import hsdraw` from Blender-bundled CPython work.
 
 ## Status
 
-Phase 0–6 implemented. See `docs/handoff.md` for the original design spec
-and `docs/notes/phaseN.md` for per-phase notes.
+Phase 0–6 implemented + scene.json import wired up. See
+`docs/handoff.md` for the original design spec, `docs/notes/phaseN.md`
+for per-phase notes, `docs/python_api.md` for the Blender-add-on Python
+surface, and `docs/roadmap.md` for what's intentionally deferred.
 
 - Reader (parse + walk JObj/DObj/MObj/POBJ tree, GX texture decode, DL unpack)
 - Writer (HSDLib `Save`-compatible, alias-root round-trip on 9-file corpus)

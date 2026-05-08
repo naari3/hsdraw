@@ -46,6 +46,63 @@ impl JObj {
     pub fn tx(&self) -> Result<f32> { self.s().get_f32(0x2C) }
     pub fn ty(&self) -> Result<f32> { self.s().get_f32(0x30) }
     pub fn tz(&self) -> Result<f32> { self.s().get_f32(0x34) }
+
+    // ----- mutators (used by `import_from_scene_json`) -----------------
+    // Mirror HSDLib `HSD_JOBJ` setters at the same offsets.  Tied to the
+    // 0x40 layout — a struct shorter than that (e.g. a freshly allocated
+    // 0-byte HsdStruct) must be `resize`d up first; the helper below does
+    // exactly that, idempotently.
+    pub fn set_flags(&self, flags: JObjFlag) -> Result<()> {
+        self.ensure_jobj_size();
+        self.0.borrow_mut().set_u32(0x04, flags.bits())
+    }
+    pub fn set_child(&self, child: Option<JObj>) {
+        self.ensure_jobj_size();
+        self.0
+            .borrow_mut()
+            .set_reference(0x08, child.map(|c| c.0));
+    }
+    pub fn set_next(&self, next: Option<JObj>) {
+        self.ensure_jobj_size();
+        self.0
+            .borrow_mut()
+            .set_reference(0x0C, next.map(|c| c.0));
+    }
+    pub fn set_rx(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x14, v) }
+    pub fn set_ry(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x18, v) }
+    pub fn set_rz(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x1C, v) }
+    pub fn set_sx(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x20, v) }
+    pub fn set_sy(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x24, v) }
+    pub fn set_sz(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x28, v) }
+    pub fn set_tx(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x2C, v) }
+    pub fn set_ty(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x30, v) }
+    pub fn set_tz(&self, v: f32) -> Result<()> { self.ensure_jobj_size(); self.0.borrow_mut().set_f32(0x34, v) }
+
+    /// Allocate a brand-new HSD_JOBJ struct: 0x40 bytes, scale=(1,1,1),
+    /// everything else zero (matches HSDLib `new HSD_JOBJ()` post-ctor
+    /// state plus the SX/SY/SZ identity init the csx import script does).
+    /// Caller is responsible for keeping the resulting `Rc` alive.
+    pub fn allocate_default() -> Self {
+        let s = HsdStruct::with_capacity(0x40).into_ref();
+        let j = JObj::from_struct(s);
+        // identity scale; csx hsd_import_from_blender.csx sets these
+        // explicitly for newly-allocated joints
+        let _ = j.set_sx(1.0);
+        let _ = j.set_sy(1.0);
+        let _ = j.set_sz(1.0);
+        j
+    }
+
+    /// Grow the underlying struct to 0x40 bytes if it isn't already.
+    /// Idempotent.  Internal helper for the setters above so that a JObj
+    /// wrapped around a too-short HsdStruct (HSDLib also allows this in
+    /// its constructor path) is auto-promoted on first write.
+    fn ensure_jobj_size(&self) {
+        let mut s = self.0.borrow_mut();
+        if s.len() < 0x40 {
+            s.resize(0x40);
+        }
+    }
 }
 
 // =====================================================================

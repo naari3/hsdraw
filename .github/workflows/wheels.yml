@@ -32,7 +32,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 6-platform matrix from docs/handoff.md "完了条件":
+          # 5-platform matrix (handoff §"完了条件" lists 6 platforms but
+          # windows-arm64 / linux-musl aren't in the supported set yet —
+          # see docs/roadmap.md).  Targets:
           #   linux x86_64 / aarch64, macos x86_64 / arm64, windows x86_64.
           # We use abi3-py37 so a single wheel covers Python 3.7+.
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, tag: linux-x86_64 }

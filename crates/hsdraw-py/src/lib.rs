@@ -117,12 +117,60 @@ fn write_dat<'py>(
     Ok(PyBytes::new(py, &out))
 }
 
+/// Apply a `scene.json` mutation onto a base .dat (alias add/remove/
+/// repoint, TRS + JOBJ_FLAG sync, hierarchy rewire, new HSD_JOBJ
+/// allocation) and return freshly-serialized output bytes.  Equivalent
+/// to driving `mkgp2-patch/tools/hsd/hsd_import_from_blender.csx` on
+/// the same inputs.
+///
+/// Returns `(out_bytes, stats_dict)` where `stats_dict` reports
+/// per-pass counts (`joints_walked`, `new_joints`, `aliases_added`,
+/// `aliases_repointed`, `aliases_removed`, `trs_changed`,
+/// `flags_changed`, `hierarchy_rewired`) so the caller can log /
+/// assert the expected delta.
+#[pyfunction]
+#[pyo3(signature = (base_dat, scene_json, /))]
+fn import_from_scene_json<'py>(
+    py: Python<'py>,
+    base_dat: &Bound<'_, PyBytes>,
+    scene_json: &Bound<'_, PyAny>,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, pyo3::types::PyDict>)> {
+    // Accept str or bytes for the JSON payload — Python users tend to
+    // hand us `open(...).read()` (str) more often than raw bytes.
+    let scene_bytes: Vec<u8> = if let Ok(b) = scene_json.cast::<PyBytes>() {
+        b.as_bytes().to_vec()
+    } else if let Ok(s) = scene_json.extract::<String>() {
+        s.into_bytes()
+    } else {
+        return Err(PyValueError::new_err(
+            "scene_json must be str or bytes",
+        ));
+    };
+    let (out, stats) = hsdraw_core::import::import_from_scene_json(
+        base_dat.as_bytes(),
+        &scene_bytes,
+    )
+    .map_err(|e| PyValueError::new_err(format!("import_from_scene_json: {:?}", e)))?;
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("joints_walked", stats.joints_walked)?;
+    dict.set_item("new_joints", stats.new_joints)?;
+    dict.set_item("aliases_added", stats.aliases_added)?;
+    dict.set_item("aliases_repointed", stats.aliases_repointed)?;
+    dict.set_item("aliases_removed", stats.aliases_removed)?;
+    dict.set_item("trs_changed", stats.trs_changed)?;
+    dict.set_item("flags_changed", stats.flags_changed)?;
+    dict.set_item("hierarchy_rewired", stats.hierarchy_rewired)?;
+    Ok((PyBytes::new(py, &out), dict))
+}
+
 #[pymodule]
 fn hsdraw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(parse_dat, m)?)?;
     m.add_function(wrap_pyfunction!(export_scene_json, m)?)?;
     m.add_function(wrap_pyfunction!(write_dat, m)?)?;
+    m.add_function(wrap_pyfunction!(import_from_scene_json, m)?)?;
     m.add_class::<PyDat>()?;
     Ok(())
 }

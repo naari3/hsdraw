@@ -109,6 +109,51 @@ impl Dat {
             .iter()
             .find(|r| Rc::ptr_eq(&r.data, target))
     }
+
+    // ------------------------------------------------------------------
+    // From-scratch synthesis factory.  Useful when a caller wants to
+    // produce a fresh .dat without reading an existing one — e.g. the
+    // mkgp2-patch Blender pipeline's vanilla-independent export path.
+    // ------------------------------------------------------------------
+
+    /// Allocate an empty `Dat` with a `scene_data` root holding a fresh
+    /// SObj → JOBJDescs[] (1 slot) → JObjDesc → root JObj chain.  All
+    /// allocated structs are placeholders — the JObj has identity scale
+    /// and zero TRS, and no DObjs yet.  Caller chains further structural
+    /// edits (joint hierarchy, DObjs, …) onto the returned root joint.
+    ///
+    /// Use `dat.scene_data().unwrap().data` to grab the SObj struct, then
+    /// `SObj::from_struct(...).jobj_descs()[0].root_joint().unwrap()` to
+    /// reach the root joint.  HSDLib equivalent of `new HSDRawFile()` +
+    /// `file.Roots.Add(new HSDRootNode { Name = "scene_data", Data = …
+    /// })` with a fresh SOBJ tree set up underneath.
+    pub fn alloc_scene_data() -> Self {
+        use crate::common::{JObj, JObjDesc, SObj, build_jobj_descs_array};
+
+        let root_joint = JObj::allocate_default();
+        let jobj_desc = JObjDesc::allocate_default();
+        jobj_desc.set_root_joint(Some(root_joint));
+
+        let descs_arr = build_jobj_descs_array(&[jobj_desc]);
+
+        let sobj = SObj::allocate_default();
+        sobj.set_jobj_descs_array(Some(descs_arr));
+
+        Self {
+            version: [0; 4],
+            roots: vec![RootNode {
+                name: "scene_data".to_owned(),
+                data: sobj.0,
+            }],
+            references: vec![],
+            // The writer's populate_cache pass will discover every reachable
+            // struct in declaration order; we don't need to seed struct_order
+            // here.  Leaving it empty matches `parse → fresh dat` semantics
+            // for from-scratch construction — same as `build_synthetic_tree`
+            // in tests/mutation.rs.
+            struct_order: vec![],
+        }
+    }
 }
 
 // =====================================================================

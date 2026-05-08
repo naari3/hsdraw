@@ -19,8 +19,8 @@ use std::rc::Rc;
 
 use hsdraw_core::accessor::Accessor;
 use hsdraw_core::common::{
-    DObj as CoreDObj, JObj as CoreJObj, MObj as CoreMObj, Material as CoreMaterial,
-    PObj as CorePObj, PeDesc as CorePeDesc,
+    DObj as CoreDObj, JObj as CoreJObj, JObjDesc as CoreJObjDesc, MObj as CoreMObj,
+    Material as CoreMaterial, PObj as CorePObj, PeDesc as CorePeDesc, SObj as CoreSObj,
 };
 use hsdraw_core::dat::RootNode;
 use hsdraw_core::gx::{JObjFlag, MaterialRenderMode};
@@ -55,6 +55,19 @@ struct PyDat {
 
 #[pymethods]
 impl PyDat {
+    /// Allocate an empty `Dat` with a fresh `scene_data` root: SObj →
+    /// JOBJDescs[1] → JObjDesc → root JObj placeholder chain.  The root
+    /// joint has identity scale and zero TRS — wire children, DObjs,
+    /// etc. onto it before saving.  HSDLib equivalent: `new HSDRawFile()`
+    /// followed by manual SOBJ tree construction.  Useful for the
+    /// vanilla-independent export pipelines (no base .dat to start from).
+    #[staticmethod]
+    fn alloc_scene_data() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(CoreDat::alloc_scene_data())),
+        }
+    }
+
     /// Snapshot of every root, in declaration order (public + alias).
     /// Each `Root` shares the underlying struct's `Rc` with the parent
     /// `Dat`, so editing a `Root.data`-derived `JObj` mutates the live
@@ -969,6 +982,148 @@ impl PyPeDesc {
 }
 
 // =====================================================================
+// SObj typed view  (HSDLib HSD_SOBJ accessor)
+// =====================================================================
+
+/// Typed view onto a 0x10-byte HSD_SOBJ struct.  HSDLib's "scene
+/// object" — root of the scene_data root — owns the JOBJDescs[] array
+/// (one entry per logical model root) plus camera / light / fog refs
+/// that this binding doesn't expose yet (course .dat doesn't exercise
+/// those slots).  Construct via `SObj.alloc()` or extract from an
+/// existing .dat via `SObj.from_struct(root.data)`.
+#[pyclass(name = "SObj", module = "hsdraw", unsendable)]
+struct PySObj {
+    inner: StructRef,
+}
+
+#[pymethods]
+impl PySObj {
+    /// Allocate a fresh 0x10-byte HSD_SOBJ.  All fields zero (no
+    /// JOBJDescs[] attached).  Pair with `set_jobj_descs([...])` to
+    /// install one or more JObjDescs.
+    #[staticmethod]
+    fn alloc() -> Self {
+        Self { inner: CoreSObj::allocate_default().0 }
+    }
+
+    #[staticmethod]
+    fn from_struct(s: &PyHsdStruct) -> Self {
+        Self { inner: s.inner.clone() }
+    }
+
+    fn as_struct(&self) -> PyHsdStruct {
+        PyHsdStruct { inner: self.inner.clone() }
+    }
+
+    /// Snapshot of every JObjDesc reachable through this SObj's
+    /// JOBJDescs[] array.  Empty if no array is attached yet.
+    fn jobj_descs(&self) -> Vec<PyJObjDesc> {
+        CoreSObj::from_struct(self.inner.clone())
+            .jobj_descs()
+            .into_iter()
+            .map(|d| PyJObjDesc { inner: d.0 })
+            .collect()
+    }
+
+    /// The raw JOBJDescs[] array struct, or `None`.  Returned as
+    /// `HsdStruct` since this is just a flat array of JObjDesc pointers
+    /// (`HSDNullPointerArrayAccessor<HSD_JOBJDesc>` in HSDLib).
+    fn jobj_descs_array(&self) -> Option<PyHsdStruct> {
+        CoreSObj::from_struct(self.inner.clone())
+            .jobj_descs_array()
+            .map(|s| PyHsdStruct { inner: s })
+    }
+
+    /// Replace the JOBJDescs[] array slot.  Pass a list of JObjDescs and
+    /// the binding builds the underlying NullPointerArrayAccessor struct
+    /// for you (4 bytes per entry plus a 4-byte NULL terminator).
+    fn set_jobj_descs(&self, descs: Vec<PyRef<'_, PyJObjDesc>>) {
+        let core: Vec<CoreJObjDesc> = descs
+            .iter()
+            .map(|d| CoreJObjDesc::from_struct(d.inner.clone()))
+            .collect();
+        let arr = hsdraw_core::common::build_jobj_descs_array(&core);
+        CoreSObj::from_struct(self.inner.clone()).set_jobj_descs_array(Some(arr));
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn __hash__(&self) -> isize {
+        Rc::as_ptr(&self.inner) as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hsdraw.SObj addr=0x{:X}>",
+            Rc::as_ptr(&self.inner) as usize
+        )
+    }
+}
+
+// =====================================================================
+// JObjDesc typed view  (HSDLib HSD_JOBJDesc accessor)
+// =====================================================================
+
+/// Typed view onto a 0x10-byte HSD_JOBJDesc struct.  Holds one root
+/// joint reference (offset 0x00) plus three anim slots (0x04..0x0C)
+/// that this binding doesn't expose (course .dat anim is read-only for
+/// now).  Construct via `JObjDesc.alloc()` then `set_root_joint(j)`.
+#[pyclass(name = "JObjDesc", module = "hsdraw", unsendable)]
+struct PyJObjDesc {
+    inner: StructRef,
+}
+
+#[pymethods]
+impl PyJObjDesc {
+    /// Allocate a fresh 0x10-byte HSD_JOBJDesc.  All fields zero.
+    #[staticmethod]
+    fn alloc() -> Self {
+        Self { inner: CoreJObjDesc::allocate_default().0 }
+    }
+
+    #[staticmethod]
+    fn from_struct(s: &PyHsdStruct) -> Self {
+        Self { inner: s.inner.clone() }
+    }
+
+    fn as_struct(&self) -> PyHsdStruct {
+        PyHsdStruct { inner: self.inner.clone() }
+    }
+
+    /// Root joint of this descriptor, or `None`.
+    #[getter]
+    fn root_joint(&self) -> Option<PyJObj> {
+        CoreJObjDesc::from_struct(self.inner.clone())
+            .root_joint()
+            .map(|j| PyJObj { inner: j.0 })
+    }
+
+    /// Set / clear the root joint.  Pass `None` to detach.
+    #[pyo3(signature = (j=None))]
+    fn set_root_joint(&self, j: Option<&PyJObj>) {
+        CoreJObjDesc::from_struct(self.inner.clone())
+            .set_root_joint(j.map(|jj| CoreJObj::from_struct(jj.inner.clone())));
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn __hash__(&self) -> isize {
+        Rc::as_ptr(&self.inner) as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hsdraw.JObjDesc addr=0x{:X}>",
+            Rc::as_ptr(&self.inner) as usize
+        )
+    }
+}
+
+// =====================================================================
 // MeshBuilder  (HSDLib POBJ_Generator equivalent for Phase 1)
 // =====================================================================
 
@@ -1177,11 +1332,17 @@ fn struct_ref_from_any(any: &Bound<'_, PyAny>) -> PyResult<StructRef> {
     if let Ok(p) = any.cast::<PyPeDesc>() {
         return Ok(p.borrow().inner.clone());
     }
+    if let Ok(s) = any.cast::<PySObj>() {
+        return Ok(s.borrow().inner.clone());
+    }
+    if let Ok(d) = any.cast::<PyJObjDesc>() {
+        return Ok(d.borrow().inner.clone());
+    }
     if let Ok(s) = any.cast::<PyHsdStruct>() {
         return Ok(s.borrow().inner.clone());
     }
     Err(PyTypeError::new_err(
-        "expected JObj / DObj / Pobj / MObj / Material / PeDesc / HsdStruct",
+        "expected JObj / DObj / Pobj / MObj / Material / PeDesc / SObj / JObjDesc / HsdStruct",
     ))
 }
 
@@ -1214,6 +1375,8 @@ fn hsdraw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMObj>()?;
     m.add_class::<PyMaterial>()?;
     m.add_class::<PyPeDesc>()?;
+    m.add_class::<PySObj>()?;
+    m.add_class::<PyJObjDesc>()?;
     m.add_class::<PyMeshBuilder>()?;
     Ok(())
 }

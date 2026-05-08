@@ -511,6 +511,60 @@ impl SObj {
         }
         out
     }
+
+    /// The raw `JOBJDescs[]` array struct (the HSDLib
+    /// `HSDNullPointerArrayAccessor<HSD_JOBJDesc>` payload).  Returned as a
+    /// `StructRef` because it has no typed accessor — callers operate on it
+    /// via `HsdStruct::set_reference(i*4, …)` to slot in additional
+    /// JObjDescs.  `None` if no array is attached yet.
+    pub fn jobj_descs_array(&self) -> Option<StructRef> {
+        self.s().get_reference(0x00)
+    }
+
+    // ----- mutators ------------------------------------------------
+    /// Allocate a fresh HSD_SOBJ: 0x10 bytes, all-zero fields (no
+    /// JOBJDescs[] attached, no cameras / lights / fog).  Mirrors HSDLib
+    /// `new HSD_SOBJ()` post-ctor state.  Pair with `set_jobj_descs_array`
+    /// to attach a populated descriptor array.
+    pub fn allocate_default() -> Self {
+        SObj::from_struct(HsdStruct::with_capacity(0x10).into_ref())
+    }
+
+    /// Attach (or detach) the `JOBJDescs[]` array struct at offset 0.
+    /// HSDLib equivalent: `sobj.JOBJDescs = HSDNullPointerArrayAccessor<…>`
+    /// — we just take the underlying array struct directly since the
+    /// "array accessor" is a tagged view, not a separate allocation.
+    pub fn set_jobj_descs_array(&self, arr: Option<StructRef>) {
+        self.ensure_sobj_size();
+        self.0.borrow_mut().set_reference(0x00, arr);
+    }
+
+    fn ensure_sobj_size(&self) {
+        let mut s = self.0.borrow_mut();
+        if s.len() < 0x10 {
+            s.resize(0x10);
+        }
+    }
+}
+
+/// Build a `JOBJDescs[]` array struct holding `descs` in order, NULL-
+/// terminated (HSDLib `HSDNullPointerArrayAccessor.Save` convention).
+///
+/// Layout: each entry is a 4-byte pointer; the `n`-entry array needs at
+/// least `4 * (n + 1)` bytes (the trailing 4-byte slot stays at zero so
+/// the reader stops there).  The *zero-entry* case still produces a 4-
+/// byte struct rather than 0 bytes — keeps the round-trip happy.
+pub fn build_jobj_descs_array(descs: &[JObjDesc]) -> StructRef {
+    let n = descs.len();
+    let cap = 4 * (n + 1);
+    let arr = HsdStruct::with_capacity(cap).into_ref();
+    {
+        let mut a = arr.borrow_mut();
+        for (i, d) in descs.iter().enumerate() {
+            a.set_reference((i * 4) as u32, Some(d.0.clone()));
+        }
+    }
+    arr
 }
 
 // =====================================================================
@@ -524,4 +578,27 @@ impl JObjDesc {
         self.ref_at::<JObj>(0x00)
     }
     // Anim slots (0x04..0x0C) intentionally not exposed yet.
+
+    // ----- mutators ------------------------------------------------
+    /// Allocate a fresh HSD_JOBJDesc: 0x10 bytes, all-zero fields (no
+    /// root joint, no anim slots).  Mirrors HSDLib `new HSD_JOBJDesc()`
+    /// post-ctor state.  Pair with `set_root_joint` to attach a joint.
+    pub fn allocate_default() -> Self {
+        JObjDesc::from_struct(HsdStruct::with_capacity(0x10).into_ref())
+    }
+
+    /// Attach (or detach) the root joint at offset 0.  HSDLib:
+    /// `desc.RootJoint = j`.  The anim slots (0x04..0x0C) are left
+    /// untouched.
+    pub fn set_root_joint(&self, j: Option<JObj>) {
+        self.ensure_jobj_desc_size();
+        self.0.borrow_mut().set_reference(0x00, j.map(|jj| jj.0));
+    }
+
+    fn ensure_jobj_desc_size(&self) {
+        let mut s = self.0.borrow_mut();
+        if s.len() < 0x10 {
+            s.resize(0x10);
+        }
+    }
 }

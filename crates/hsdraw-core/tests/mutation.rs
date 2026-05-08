@@ -403,6 +403,82 @@ fn primitive_set_reference_deep_field_repoint_round_trips() {
     assert!((root2.tx().unwrap() - 99.0).abs() < 1e-6);
 }
 
+// =====================================================================
+// Dat::alloc_scene_data — from-scratch synthesis factory.  The output
+// must be structurally equivalent to `build_synthetic_tree` minus the
+// custom TRS values: same root chain (scene_data → SObj → JOBJDescs[1]
+// → JObjDesc → root JObj), same struct sizes, identity scale on the
+// root joint, and a clean write → re-parse round-trip.
+// =====================================================================
+
+#[test]
+fn alloc_scene_data_factory_matches_manual_synthesis() {
+    let dat = Dat::alloc_scene_data();
+
+    // Single scene_data root.
+    assert_eq!(dat.roots.len(), 1);
+    assert_eq!(dat.roots[0].name, "scene_data");
+    assert!(dat.references.is_empty());
+
+    // Walk SObj → JOBJDescs[] → JObjDesc → RootJoint without typed views,
+    // matching how an addon would walk the chain.
+    let sobj_struct = &dat.roots[0].data;
+    assert_eq!(
+        sobj_struct.borrow().len(),
+        0x10,
+        "SObj should be 0x10 bytes (HSDLib TrimmedSize)"
+    );
+
+    let descs_arr = sobj_struct
+        .borrow()
+        .get_reference(0x00)
+        .expect("SObj should reference JOBJDescs[] at offset 0");
+    // Array struct holds 1 entry + a NULL slot terminator → 0x08 bytes.
+    assert_eq!(descs_arr.borrow().len(), 0x08);
+
+    let jobj_desc = descs_arr
+        .borrow()
+        .get_reference(0x00)
+        .expect("JOBJDescs[0] must be set");
+    assert!(
+        descs_arr.borrow().get_reference(0x04).is_none(),
+        "JOBJDescs[1] (the NULL terminator) must be absent"
+    );
+    assert_eq!(
+        jobj_desc.borrow().len(),
+        0x10,
+        "JObjDesc should be 0x10 bytes"
+    );
+
+    let root_joint = jobj_desc
+        .borrow()
+        .get_reference(0x00)
+        .expect("JObjDesc.RootJoint must be set");
+    assert_eq!(root_joint.borrow().len(), 0x40, "JObj should be 0x40 bytes");
+
+    // Sanity: the root joint has identity scale (the JObj::allocate_default
+    // default).  Zero TRS and zero flags.
+    let root = JObj::from_struct(root_joint);
+    assert!((root.sx().unwrap() - 1.0).abs() < 1e-6);
+    assert!((root.sy().unwrap() - 1.0).abs() < 1e-6);
+    assert!((root.sz().unwrap() - 1.0).abs() < 1e-6);
+    assert_eq!(root.tx().unwrap(), 0.0);
+    assert_eq!(root.flags().unwrap().bits(), 0);
+
+    // Round-trip: write → re-parse → same shape, same sizes.  Joints renumber
+    // on re-parse but the SOBJ tree must stay structurally identical.
+    let written = dat.write().expect("write");
+    let dat2 = Dat::parse(&written).expect("reparse");
+    assert_eq!(dat2.roots.len(), 1);
+    assert_eq!(dat2.roots[0].name, "scene_data");
+
+    let sobj2 = SObj::from_struct(dat2.roots[0].data.clone());
+    let descs2 = sobj2.jobj_descs();
+    assert_eq!(descs2.len(), 1, "exactly one JObjDesc after round-trip");
+    let root2 = descs2[0].root_joint().expect("RootJoint after round-trip");
+    assert!((root2.sx().unwrap() - 1.0).abs() < 1e-6);
+}
+
 #[test]
 fn synthetic_struct_references_enumerate() {
     let dat = build_synthetic_tree();

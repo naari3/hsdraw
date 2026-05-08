@@ -1,0 +1,11 @@
+[package]
+name = "hsdraw-core"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

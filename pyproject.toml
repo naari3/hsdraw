@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hsdraw"
+description = "HSD .dat reader/writer (Rust, with PyO3 bindings)"
+license = { text = "MIT OR Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/naari3/hsdraw"
+Issues = "https://github.com/naari3/hsdraw/issues"
+
+[tool.maturin]
+manifest-path = "crates/hsdraw-py/Cargo.toml"
+module-name = "hsdraw"
+features = ["pyo3/extension-module"]
+strip = true

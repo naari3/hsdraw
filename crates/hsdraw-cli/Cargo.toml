@@ -1,0 +1,16 @@
+[package]
+name = "hsdraw-cli"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "hsdraw-cli"
+path = "src/main.rs"
+
+[dependencies]
+hsdraw-core = { path = "../hsdraw-core" }
+
+[lints]
+workspace = true

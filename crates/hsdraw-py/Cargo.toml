@@ -1,0 +1,17 @@
+[package]
+name = "hsdraw-py"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lib]
+name = "hsdraw"
+crate-type = ["cdylib"]
+
+[dependencies]
+hsdraw-core = { path = "../hsdraw-core" }
+pyo3 = { version = "0.28.3", features = ["abi3-py37", "extension-module"] }
+
+[lints]
+workspace = true

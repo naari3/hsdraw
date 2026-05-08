@@ -1,0 +1,22 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Python / maturin / wheels
+*.pyd
+*.so
+*.dylib
+__pycache__/
+*.egg-info/
+.venv/
+venv/
+dist/
+wheels/
+
+# parity test artifacts (mismatch dumps)
+tests/parity/artifacts/
+
+# IDE
+.idea/
+.vscode/
+*.swp

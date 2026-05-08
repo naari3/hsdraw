@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hsdraw-core",
+    "crates/hsdraw-py",
+    "crates/hsdraw-cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/naari3/hsdraw"
+version = "0.0.1"
+
+[workspace.lints.rust]
+unused_must_use = "deny"

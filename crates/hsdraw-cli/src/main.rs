@@ -13,6 +13,7 @@ use hsdraw_core::accessor::{Accessor, id_of};
 use hsdraw_core::common::{DObj, JObj, MObj, PObj, SObj, TObj};
 use hsdraw_core::error::HsdError;
 use hsdraw_core::gx::{jobj_flag_names, render_flag_names};
+use hsdraw_core::gx_dl;
 use hsdraw_core::gx_image;
 use hsdraw_core::Dat;
 
@@ -385,23 +386,26 @@ fn walk_pobj(p: &PObj, depth: usize) -> std::result::Result<(), HsdError> {
     while let Some(pobj) = cur {
         let prefix = "  ".repeat(depth);
         let dl_size = pobj.display_list_size()?;
-        let dl_first = pobj
-            .display_list_buffer()
-            .map(|b| {
-                b.iter()
-                    .take(8)
-                    .map(|x| format!("{:02X}", x))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
         let sb = pobj.single_bound_jobj()?;
+
+        // Unpack the DL fully so we surface vertex/primitive counts in the
+        // dump.  Errors are non-fatal — we just note them and keep walking.
+        let dl_summary = match gx_dl::unpack(&pobj) {
+            Ok(dl) => format!(
+                "verts={} prims={} attrs={}",
+                dl.total_vertices(),
+                dl.primitives.len(),
+                dl.attributes.len().saturating_sub(1) // exclude NULL terminator
+            ),
+            Err(e) => format!("DL_ERR: {:?}", e),
+        };
+
         println!(
-            "{}PObj#{} flags=0x{:04X} DLsize={} DL[0..8]={}{}",
+            "{}PObj#{} flags=0x{:04X} DLsize={} {}{}",
             prefix, idx,
             pobj.flags()?.bits(),
             dl_size,
-            dl_first,
+            dl_summary,
             if sb.is_some() { " sb=Yes" } else { "" },
         );
         cur = pobj.next();

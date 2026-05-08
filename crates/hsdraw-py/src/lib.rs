@@ -19,11 +19,15 @@ use std::rc::Rc;
 
 use hsdraw_core::accessor::Accessor;
 use hsdraw_core::common::{
-    DObj as CoreDObj, JObj as CoreJObj, JObjDesc as CoreJObjDesc, MObj as CoreMObj,
-    Material as CoreMaterial, PObj as CorePObj, PeDesc as CorePeDesc, SObj as CoreSObj,
+    DObj as CoreDObj, Image as CoreImage, JObj as CoreJObj, JObjDesc as CoreJObjDesc,
+    MObj as CoreMObj, Material as CoreMaterial, PObj as CorePObj, PeDesc as CorePeDesc,
+    SObj as CoreSObj, TObj as CoreTObj,
 };
 use hsdraw_core::dat::RootNode;
-use hsdraw_core::gx::{JObjFlag, MaterialRenderMode};
+use hsdraw_core::gx::{
+    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexMapId, GxWrapMode, JObjFlag,
+    MaterialRenderMode, TObjFlags,
+};
 use hsdraw_core::hsd_struct::{StructRef, ptr_eq};
 use hsdraw_core::pobj_writer::MeshBuilder as CoreMeshBuilder;
 use hsdraw_core::{export, Dat as CoreDat};
@@ -742,15 +746,13 @@ impl PyMObj {
             .map(|s| PyPeDesc { inner: s })
     }
 
-    /// Attached TObj chain head, or `None` (returned as raw
-    /// `HsdStruct` since this binding doesn't yet ship a typed TObj
-    /// wrapper — texture re-pack is roadmapped, see `docs/roadmap.md`).
+    /// Attached TObj chain head, or `None`.
     #[getter]
-    fn textures(&self) -> Option<PyHsdStruct> {
+    fn textures(&self) -> Option<PyTObj> {
         self.inner
             .borrow()
             .get_reference(0x08)
-            .map(|s| PyHsdStruct { inner: s })
+            .map(|s| PyTObj { inner: s })
     }
 
     #[pyo3(signature = (material=None))]
@@ -767,12 +769,16 @@ impl PyMObj {
         );
     }
 
-    /// Set the TObj chain head.  Accepts a raw `HsdStruct` (typed
-    /// TObj wrapper not yet shipped); `None` detaches.
+    /// Set the TObj chain head.  Accepts a `TObj` typed view or any
+    /// other struct handle (raw `HsdStruct`, etc.); `None` detaches.
     #[pyo3(signature = (tobj=None))]
-    fn set_textures(&self, tobj: Option<&PyHsdStruct>) {
-        let mut s = self.inner.borrow_mut();
-        s.set_reference(0x08, tobj.map(|t| t.inner.clone()));
+    fn set_textures(&self, tobj: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let target = match tobj {
+            Some(b) => Some(struct_ref_from_any(b)?),
+            None => None,
+        };
+        self.inner.borrow_mut().set_reference(0x08, target);
+        Ok(())
     }
 
     fn __eq__(&self, other: &Self) -> bool {
@@ -1124,6 +1130,390 @@ impl PyJObjDesc {
 }
 
 // =====================================================================
+// TObj typed view  (HSDLib HSD_TOBJ accessor)
+// =====================================================================
+
+/// Typed view onto a 0x5C-byte HSD_TOBJ struct.  Holds the texture
+/// slot id, transform (rotation / scale / translation), wrap modes,
+/// flags + coord/color/alpha operation nibbles, blending factor, mag
+/// filter, and references to the `Image` (raw GX-encoded payload) and
+/// `Tlut` (palette, where applicable).  Construct via `TObj.alloc()`,
+/// then attach a `Image` via `set_image_data` and wire into a `MObj`
+/// via `MObj.set_textures(tobj)`.  Multiple TObjs can be chained via
+/// `set_next` for textures 0..N on the same material.
+#[pyclass(name = "TObj", module = "hsdraw", unsendable)]
+struct PyTObj {
+    inner: StructRef,
+}
+
+#[pymethods]
+impl PyTObj {
+    /// Allocate a fresh 0x5C-byte HSD_TOBJ.  All fields zero (no
+    /// image, no TLUT, identity-zero TRS, wrap=CLAMP).
+    #[staticmethod]
+    fn alloc() -> Self {
+        Self { inner: CoreTObj::allocate_default().0 }
+    }
+
+    #[staticmethod]
+    fn from_struct(s: &PyHsdStruct) -> Self {
+        Self { inner: s.inner.clone() }
+    }
+
+    fn as_struct(&self) -> PyHsdStruct {
+        PyHsdStruct { inner: self.inner.clone() }
+    }
+
+    // ----- chain --------------------------------------------------
+    /// Next TObj in the texture chain, or `None`.
+    #[getter]
+    fn next(&self) -> Option<PyTObj> {
+        CoreTObj::from_struct(self.inner.clone())
+            .next()
+            .map(|t| PyTObj { inner: t.0 })
+    }
+
+    #[pyo3(signature = (next=None))]
+    fn set_next(&self, next: Option<&PyTObj>) {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_next(next.map(|n| CoreTObj::from_struct(n.inner.clone())));
+    }
+
+    // ----- texture slot id ----------------------------------------
+    /// `GX_TEXMAP*` value as `u32` (0..7 = TEXMAP0..7).
+    #[getter]
+    fn tex_map_id(&self) -> PyResult<u32> {
+        CoreTObj::from_struct(self.inner.clone())
+            .tex_map_id()
+            .map(u32::from)
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_tex_map_id(&self, v: u32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_tex_map_id(GxTexMapId::from(v))
+            .map_err(map_err)
+    }
+
+    // ----- transform triples --------------------------------------
+    fn set_rotation(&self, rx: f32, ry: f32, rz: f32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_rotation(rx, ry, rz)
+            .map_err(map_err)
+    }
+
+    fn set_scale(&self, sx: f32, sy: f32, sz: f32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_scale(sx, sy, sz)
+            .map_err(map_err)
+    }
+
+    fn set_translation(&self, tx: f32, ty: f32, tz: f32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_translation(tx, ty, tz)
+            .map_err(map_err)
+    }
+
+    // ----- wrap / repeat ------------------------------------------
+    /// `GX_WRAPMODE` value (0=CLAMP, 1=REPEAT, 2=MIRROR).
+    #[getter]
+    fn wrap_s(&self) -> PyResult<u32> {
+        CoreTObj::from_struct(self.inner.clone())
+            .wrap_s()
+            .map(u32::from)
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_wrap_s(&self, v: u32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_wrap_s(GxWrapMode::from(v))
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn wrap_t(&self) -> PyResult<u32> {
+        CoreTObj::from_struct(self.inner.clone())
+            .wrap_t()
+            .map(u32::from)
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_wrap_t(&self, v: u32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_wrap_t(GxWrapMode::from(v))
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn repeat_s(&self) -> PyResult<u8> {
+        CoreTObj::from_struct(self.inner.clone()).repeat_s().map_err(map_err)
+    }
+
+    #[setter]
+    fn set_repeat_s(&self, v: u8) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone()).set_repeat_s(v).map_err(map_err)
+    }
+
+    #[getter]
+    fn repeat_t(&self) -> PyResult<u8> {
+        CoreTObj::from_struct(self.inner.clone()).repeat_t().map_err(map_err)
+    }
+
+    #[setter]
+    fn set_repeat_t(&self, v: u8) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone()).set_repeat_t(v).map_err(map_err)
+    }
+
+    // ----- flags + nibbles ----------------------------------------
+    /// Raw 0x40 word (`TObjFlags` bits, plus the `coord_type` /
+    /// `color_operation` / `alpha_operation` nibbles HSDLib packs into
+    /// the same u32).  Setter clobbers all 32 bits — use the per-
+    /// nibble setters below for in-place updates.
+    #[getter]
+    fn flags(&self) -> PyResult<u32> {
+        CoreTObj::from_struct(self.inner.clone())
+            .flags()
+            .map(|f| f.bits())
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_flags(&self, v: u32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_flags(TObjFlags::from_bits_retain(v))
+            .map_err(map_err)
+    }
+
+    fn set_coord_type(&self, coord: u32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_coord_type(CoordType::from(coord))
+            .map_err(map_err)
+    }
+
+    fn set_color_operation(&self, op: u32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_color_operation(ColorMap::from(op))
+            .map_err(map_err)
+    }
+
+    fn set_alpha_operation(&self, op: u32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_alpha_operation(AlphaMap::from(op))
+            .map_err(map_err)
+    }
+
+    // ----- blending / filter --------------------------------------
+    #[getter]
+    fn blending(&self) -> PyResult<f32> {
+        CoreTObj::from_struct(self.inner.clone()).blending().map_err(map_err)
+    }
+
+    #[setter]
+    fn set_blending(&self, v: f32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone()).set_blending(v).map_err(map_err)
+    }
+
+    #[getter]
+    fn mag_filter(&self) -> PyResult<u32> {
+        CoreTObj::from_struct(self.inner.clone())
+            .mag_filter()
+            .map(u32::from)
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_mag_filter(&self, v: u32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_mag_filter(GxTexFilter::from(v))
+            .map_err(map_err)
+    }
+
+    // ----- image / tlut refs --------------------------------------
+    /// Attached `Image`, or `None`.
+    #[getter]
+    fn image_data(&self) -> Option<PyImage> {
+        CoreTObj::from_struct(self.inner.clone())
+            .image_data()
+            .map(|i| PyImage { inner: i.0 })
+    }
+
+    /// Set / clear the `Image` reference.  Pass `None` to detach.
+    #[pyo3(signature = (img=None))]
+    fn set_image_data(&self, img: Option<&PyImage>) {
+        CoreTObj::from_struct(self.inner.clone()).set_image_data(
+            img.map(|i| CoreImage::from_struct(i.inner.clone())),
+        );
+    }
+
+    /// Attached `Tlut` palette struct, or `None`.  Returned as raw
+    /// `HsdStruct` since this binding doesn't ship a typed Tlut wrapper
+    /// (paletted formats aren't on the H2/H3 scope — see
+    /// `docs/roadmap.md` § texture re-pack).
+    #[getter]
+    fn tlut_data(&self) -> Option<PyHsdStruct> {
+        self.inner
+            .borrow()
+            .get_reference(0x50)
+            .map(|s| PyHsdStruct { inner: s })
+    }
+
+    #[pyo3(signature = (tlut=None))]
+    fn set_tlut_data(&self, tlut: Option<&PyHsdStruct>) {
+        let mut s = self.inner.borrow_mut();
+        s.set_reference(0x50, tlut.map(|t| t.inner.clone()));
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn __hash__(&self) -> isize {
+        Rc::as_ptr(&self.inner) as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hsdraw.TObj addr=0x{:X}>",
+            Rc::as_ptr(&self.inner) as usize
+        )
+    }
+}
+
+// =====================================================================
+// Image typed view  (HSDLib HSD_Image accessor)
+// =====================================================================
+
+/// Typed view onto a 0x18-byte HSD_Image struct.  Holds a reference to
+/// the raw GX-encoded byte payload (offset 0) plus width / height /
+/// format / mipmap / min_lod / max_lod fields.  Construct via
+/// `Image.alloc()`, attach raw bytes via `set_image_data_bytes(b)`, and
+/// wire into a TObj via `TObj.set_image_data(img)`.
+#[pyclass(name = "Image", module = "hsdraw", unsendable)]
+struct PyImage {
+    inner: StructRef,
+}
+
+#[pymethods]
+impl PyImage {
+    /// Allocate a fresh 0x18-byte HSD_Image.  All fields zero.
+    #[staticmethod]
+    fn alloc() -> Self {
+        Self { inner: CoreImage::allocate_default().0 }
+    }
+
+    #[staticmethod]
+    fn from_struct(s: &PyHsdStruct) -> Self {
+        Self { inner: s.inner.clone() }
+    }
+
+    fn as_struct(&self) -> PyHsdStruct {
+        PyHsdStruct { inner: self.inner.clone() }
+    }
+
+    /// Raw GX-encoded bytes (already-encoded — use
+    /// `hsdraw.gx_encode(format, w, h, rgba)` to produce these from
+    /// a 4-channel RGBA8 source).  `None` if no payload is attached.
+    fn image_data<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        CoreImage::from_struct(self.inner.clone())
+            .image_data()
+            .map(|v| PyBytes::new(py, &v))
+    }
+
+    /// Wrap raw GX-encoded bytes in a fresh leaf buffer struct and
+    /// attach at offset 0.  Marks the buffer as 0x20-aligned (HSDLib
+    /// `IsBufferAligned` convention for textures).
+    fn set_image_data_bytes(&self, bytes: &Bound<'_, PyBytes>) {
+        CoreImage::from_struct(self.inner.clone())
+            .set_image_data_bytes(bytes.as_bytes().to_vec());
+    }
+
+    #[getter]
+    fn width(&self) -> PyResult<i16> {
+        CoreImage::from_struct(self.inner.clone()).width().map_err(map_err)
+    }
+
+    #[setter]
+    fn set_width(&self, v: i16) -> PyResult<()> {
+        CoreImage::from_struct(self.inner.clone()).set_width(v).map_err(map_err)
+    }
+
+    #[getter]
+    fn height(&self) -> PyResult<i16> {
+        CoreImage::from_struct(self.inner.clone()).height().map_err(map_err)
+    }
+
+    #[setter]
+    fn set_height(&self, v: i16) -> PyResult<()> {
+        CoreImage::from_struct(self.inner.clone()).set_height(v).map_err(map_err)
+    }
+
+    /// `GX_TF_*` enum value as `u32` (0=I4, 1=I8, 2=IA4, 3=IA8,
+    /// 4=RGB565, 5=RGB5A3, 6=RGBA8, 14=CMP).
+    #[getter]
+    fn format(&self) -> PyResult<u32> {
+        CoreImage::from_struct(self.inner.clone())
+            .format()
+            .map(u32::from)
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_format(&self, v: u32) -> PyResult<()> {
+        CoreImage::from_struct(self.inner.clone())
+            .set_format(GxTexFmt::from(v))
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn mipmap(&self) -> PyResult<i32> {
+        CoreImage::from_struct(self.inner.clone()).mipmap().map_err(map_err)
+    }
+
+    #[setter]
+    fn set_mipmap(&self, v: i32) -> PyResult<()> {
+        CoreImage::from_struct(self.inner.clone()).set_mipmap(v).map_err(map_err)
+    }
+
+    #[getter]
+    fn min_lod(&self) -> PyResult<f32> {
+        CoreImage::from_struct(self.inner.clone()).min_lod().map_err(map_err)
+    }
+
+    #[setter]
+    fn set_min_lod(&self, v: f32) -> PyResult<()> {
+        CoreImage::from_struct(self.inner.clone()).set_min_lod(v).map_err(map_err)
+    }
+
+    #[getter]
+    fn max_lod(&self) -> PyResult<f32> {
+        CoreImage::from_struct(self.inner.clone()).max_lod().map_err(map_err)
+    }
+
+    #[setter]
+    fn set_max_lod(&self, v: f32) -> PyResult<()> {
+        CoreImage::from_struct(self.inner.clone()).set_max_lod(v).map_err(map_err)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn __hash__(&self) -> isize {
+        Rc::as_ptr(&self.inner) as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hsdraw.Image addr=0x{:X}>",
+            Rc::as_ptr(&self.inner) as usize
+        )
+    }
+}
+
+// =====================================================================
 // MeshBuilder  (HSDLib POBJ_Generator equivalent for Phase 1)
 // =====================================================================
 
@@ -1338,11 +1728,17 @@ fn struct_ref_from_any(any: &Bound<'_, PyAny>) -> PyResult<StructRef> {
     if let Ok(d) = any.cast::<PyJObjDesc>() {
         return Ok(d.borrow().inner.clone());
     }
+    if let Ok(t) = any.cast::<PyTObj>() {
+        return Ok(t.borrow().inner.clone());
+    }
+    if let Ok(i) = any.cast::<PyImage>() {
+        return Ok(i.borrow().inner.clone());
+    }
     if let Ok(s) = any.cast::<PyHsdStruct>() {
         return Ok(s.borrow().inner.clone());
     }
     Err(PyTypeError::new_err(
-        "expected JObj / DObj / Pobj / MObj / Material / PeDesc / SObj / JObjDesc / HsdStruct",
+        "expected JObj / DObj / Pobj / MObj / Material / PeDesc / SObj / JObjDesc / TObj / Image / HsdStruct",
     ))
 }
 
@@ -1377,6 +1773,8 @@ fn hsdraw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPeDesc>()?;
     m.add_class::<PySObj>()?;
     m.add_class::<PyJObjDesc>()?;
+    m.add_class::<PyTObj>()?;
+    m.add_class::<PyImage>()?;
     m.add_class::<PyMeshBuilder>()?;
     Ok(())
 }

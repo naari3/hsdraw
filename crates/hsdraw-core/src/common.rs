@@ -443,6 +443,148 @@ impl TObj {
     }
     pub fn image_data(&self) -> Option<Image> { self.ref_at::<Image>(0x4C) }
     pub fn tlut_data(&self) -> Option<Tlut> { self.ref_at::<Tlut>(0x50) }
+
+    // ----- mutators ------------------------------------------------
+    /// Allocate a fresh HSD_TOBJ: 0x5C bytes, all-zero fields (no
+    /// image data, no TLUT, identity-zero TRS, wrap=CLAMP, repeat=0,
+    /// no flags).  Mirrors HSDLib `new HSD_TOBJ()` post-ctor state.
+    /// Pair with the per-field setters below to fill in tex_map_id /
+    /// scale / wrap / image_data / etc. as needed.
+    pub fn allocate_default() -> Self {
+        TObj::from_struct(HsdStruct::with_capacity(0x5C).into_ref())
+    }
+
+    pub fn set_next(&self, next: Option<TObj>) {
+        self.ensure_tobj_size();
+        self.0.borrow_mut().set_reference(0x04, next.map(|t| t.0));
+    }
+
+    pub fn set_tex_map_id(&self, id: GxTexMapId) -> Result<()> {
+        self.ensure_tobj_size();
+        self.0.borrow_mut().set_u32(0x08, u32::from(id))
+    }
+
+    /// Set rotation triple at (0x10, 0x14, 0x18).
+    pub fn set_rotation(&self, rx: f32, ry: f32, rz: f32) -> Result<()> {
+        self.ensure_tobj_size();
+        let mut s = self.0.borrow_mut();
+        s.set_f32(0x10, rx)?;
+        s.set_f32(0x14, ry)?;
+        s.set_f32(0x18, rz)
+    }
+
+    /// Set scale triple at (0x1C, 0x20, 0x24).
+    pub fn set_scale(&self, sx: f32, sy: f32, sz: f32) -> Result<()> {
+        self.ensure_tobj_size();
+        let mut s = self.0.borrow_mut();
+        s.set_f32(0x1C, sx)?;
+        s.set_f32(0x20, sy)?;
+        s.set_f32(0x24, sz)
+    }
+
+    /// Set translation triple at (0x28, 0x2C, 0x30).
+    pub fn set_translation(&self, tx: f32, ty: f32, tz: f32) -> Result<()> {
+        self.ensure_tobj_size();
+        let mut s = self.0.borrow_mut();
+        s.set_f32(0x28, tx)?;
+        s.set_f32(0x2C, ty)?;
+        s.set_f32(0x30, tz)
+    }
+
+    pub fn set_wrap_s(&self, w: GxWrapMode) -> Result<()> {
+        self.ensure_tobj_size();
+        self.0.borrow_mut().set_u32(0x34, u32::from(w))
+    }
+
+    pub fn set_wrap_t(&self, w: GxWrapMode) -> Result<()> {
+        self.ensure_tobj_size();
+        self.0.borrow_mut().set_u32(0x38, u32::from(w))
+    }
+
+    pub fn set_repeat_s(&self, v: u8) -> Result<()> {
+        self.ensure_tobj_size();
+        self.0.borrow_mut().data_mut()[0x3C] = v;
+        Ok(())
+    }
+
+    pub fn set_repeat_t(&self, v: u8) -> Result<()> {
+        self.ensure_tobj_size();
+        self.0.borrow_mut().data_mut()[0x3D] = v;
+        Ok(())
+    }
+
+    /// Set the flags u32 at offset 0x40.  HSDLib packs `coord_type`
+    /// (low 4 bits), `color_operation` (bits 16-19) and
+    /// `alpha_operation` (bits 20-23) into the same word; if you want
+    /// to set those without clobbering the base flags use
+    /// `set_coord_type` / `set_color_operation` / `set_alpha_operation`,
+    /// which read-modify-write the relevant nibble in place.
+    pub fn set_flags(&self, flags: TObjFlags) -> Result<()> {
+        self.ensure_tobj_size();
+        self.0.borrow_mut().set_u32(0x40, flags.bits())
+    }
+
+    /// Replace the low 4 bits of the 0x40 word with `coord` (the GX
+    /// `_GX_TG_TYPE` value).  Other bits in the word are preserved.
+    pub fn set_coord_type(&self, coord: CoordType) -> Result<()> {
+        self.modify_flag_nibble(0, u32::from(coord))
+    }
+
+    /// Replace bits 16-19 of the 0x40 word with `op`.  Other bits are
+    /// preserved.
+    pub fn set_color_operation(&self, op: ColorMap) -> Result<()> {
+        self.modify_flag_nibble(16, u32::from(op))
+    }
+
+    /// Replace bits 20-23 of the 0x40 word with `op`.  Other bits are
+    /// preserved.
+    pub fn set_alpha_operation(&self, op: AlphaMap) -> Result<()> {
+        self.modify_flag_nibble(20, u32::from(op))
+    }
+
+    fn modify_flag_nibble(&self, shift: u32, val: u32) -> Result<()> {
+        self.ensure_tobj_size();
+        let mut s = self.0.borrow_mut();
+        let old = s.get_u32(0x40)?;
+        let mask = !(0xF_u32 << shift);
+        let new = (old & mask) | ((val & 0xF) << shift);
+        s.set_u32(0x40, new)
+    }
+
+    pub fn set_blending(&self, v: f32) -> Result<()> {
+        self.ensure_tobj_size();
+        self.0.borrow_mut().set_f32(0x44, v)
+    }
+
+    pub fn set_mag_filter(&self, f: GxTexFilter) -> Result<()> {
+        self.ensure_tobj_size();
+        self.0.borrow_mut().set_u32(0x48, u32::from(f))
+    }
+
+    /// Attach (or detach) the `Image` reference at offset 0x4C.
+    /// HSDLib: `tobj.ImageData = HSD_Image`.
+    pub fn set_image_data(&self, img: Option<Image>) {
+        self.ensure_tobj_size();
+        self.0
+            .borrow_mut()
+            .set_reference(0x4C, img.map(|i| i.0));
+    }
+
+    /// Attach (or detach) the `Tlut` reference at offset 0x50.  HSDLib:
+    /// `tobj.TLUTData = HSD_Tlut`.
+    pub fn set_tlut_data(&self, tlut: Option<Tlut>) {
+        self.ensure_tobj_size();
+        self.0
+            .borrow_mut()
+            .set_reference(0x50, tlut.map(|t| t.0));
+    }
+
+    fn ensure_tobj_size(&self) {
+        let mut s = self.0.borrow_mut();
+        if s.len() < 0x5C {
+            s.resize(0x5C);
+        }
+    }
 }
 
 // =====================================================================
@@ -455,6 +597,15 @@ impl Image {
     pub fn image_data(&self) -> Option<Vec<u8>> {
         self.s().get_reference(0x00).map(|s| s.borrow().data().to_vec())
     }
+    /// Underlying buffer struct (= the raw GX-encoded bytes payload).
+    /// Returned as `StructRef` since this is a leaf buffer with no
+    /// outgoing references; useful when callers need to share the same
+    /// payload across multiple Images (writer buffer dedup picks it up
+    /// either way, but identity-share keeps the parse-side `Rc::ptr_eq`
+    /// invariant intact).
+    pub fn image_data_struct(&self) -> Option<StructRef> {
+        self.s().get_reference(0x00)
+    }
     pub fn width(&self) -> Result<i16> { self.s().get_i16(0x04) }
     pub fn height(&self) -> Result<i16> { self.s().get_i16(0x06) }
     pub fn format(&self) -> Result<GxTexFmt> {
@@ -463,6 +614,76 @@ impl Image {
     pub fn mipmap(&self) -> Result<i32> { self.s().get_i32(0x0C) }
     pub fn min_lod(&self) -> Result<f32> { self.s().get_f32(0x10) }
     pub fn max_lod(&self) -> Result<f32> { self.s().get_f32(0x14) }
+
+    // ----- mutators ------------------------------------------------
+    /// Allocate a fresh HSD_Image: 0x18 bytes, all-zero fields (no raw
+    /// bytes attached, width/height = 0, format = I4 (=0)).  Mirrors
+    /// HSDLib `new HSD_Image()` post-ctor state.  Pair with
+    /// `set_image_data` + `set_width` + `set_height` + `set_format` to
+    /// fill in the actual texture payload.
+    pub fn allocate_default() -> Self {
+        Image::from_struct(HsdStruct::with_capacity(0x18).into_ref())
+    }
+
+    /// Wrap raw GX-encoded bytes (typically from `gx_image::encode_image`)
+    /// in a fresh leaf buffer struct and attach it at offset 0.  Marks
+    /// the buffer as 0x20-aligned (writer convention for texture data).
+    /// HSDLib equivalent: `image.ImageData = HSDStruct(rawBytes)`
+    /// followed by the `IsBufferAligned` flag pull.
+    pub fn set_image_data_bytes(&self, bytes: Vec<u8>) {
+        self.ensure_image_size();
+        let buf = HsdStruct::from_bytes(bytes).into_ref();
+        // Texture payloads must land on a 0x20 boundary at write time,
+        // matching HSDLib's `_isBufferAligned` semantics.
+        buf.borrow_mut().is_buffer_aligned = true;
+        self.0.borrow_mut().set_reference(0x00, Some(buf));
+    }
+
+    /// Replace (or detach) the raw-bytes ref at offset 0 with an
+    /// existing `StructRef`.  Useful for sharing one image_data payload
+    /// across multiple Images (e.g. mipmap chain re-use, multi-TObj
+    /// aliasing).  Pass `None` to detach.
+    pub fn set_image_data_struct(&self, buf: Option<StructRef>) {
+        self.ensure_image_size();
+        self.0.borrow_mut().set_reference(0x00, buf);
+    }
+
+    pub fn set_width(&self, w: i16) -> Result<()> {
+        self.ensure_image_size();
+        self.0.borrow_mut().set_i16(0x04, w)
+    }
+
+    pub fn set_height(&self, h: i16) -> Result<()> {
+        self.ensure_image_size();
+        self.0.borrow_mut().set_i16(0x06, h)
+    }
+
+    pub fn set_format(&self, f: GxTexFmt) -> Result<()> {
+        self.ensure_image_size();
+        self.0.borrow_mut().set_u32(0x08, u32::from(f))
+    }
+
+    pub fn set_mipmap(&self, v: i32) -> Result<()> {
+        self.ensure_image_size();
+        self.0.borrow_mut().set_i32(0x0C, v)
+    }
+
+    pub fn set_min_lod(&self, v: f32) -> Result<()> {
+        self.ensure_image_size();
+        self.0.borrow_mut().set_f32(0x10, v)
+    }
+
+    pub fn set_max_lod(&self, v: f32) -> Result<()> {
+        self.ensure_image_size();
+        self.0.borrow_mut().set_f32(0x14, v)
+    }
+
+    fn ensure_image_size(&self) {
+        let mut s = self.0.borrow_mut();
+        if s.len() < 0x18 {
+            s.resize(0x18);
+        }
+    }
 }
 
 // =====================================================================

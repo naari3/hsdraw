@@ -9,10 +9,13 @@
 
 use hsdraw_core::accessor::Accessor;
 use hsdraw_core::common::{
-    DObj, JObj, MObj, Material, PeDesc, SObj,
+    DObj, Image, JObj, MObj, Material, PeDesc, SObj, TObj,
 };
 use hsdraw_core::dat::{Dat, RootNode};
-use hsdraw_core::gx::MaterialRenderMode;
+use hsdraw_core::gx::{
+    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexMapId, GxWrapMode,
+    MaterialRenderMode, TObjFlags,
+};
 use hsdraw_core::hsd_struct::HsdStruct;
 
 /// Wire a MObj into a synthetic Dat the same way the POBJ-writer
@@ -121,6 +124,157 @@ fn unlit_color_preset_round_trips() {
     assert_eq!(mat2.dif_rgba().unwrap(), [0xFF, 0x00, 0x00, 0xFF]);
     assert!((mat2.alpha().unwrap() - 1.0).abs() < 1e-6);
     assert!((mat2.shininess().unwrap() - 50.0).abs() < 1e-6);
+}
+
+// =====================================================================
+// TObj / Image allocator + setters
+// =====================================================================
+
+#[test]
+fn tobj_default_is_0x5c_bytes_zero() {
+    let t = TObj::allocate_default();
+    assert_eq!(t.0.borrow().len(), 0x5C);
+    // All numeric fields zero, no image_data / tlut.
+    assert_eq!(t.tex_map_id().unwrap(), GxTexMapId::GX_TEXMAP0);
+    assert_eq!(t.rx().unwrap(), 0.0);
+    assert_eq!(t.flags().unwrap().bits(), 0);
+    assert_eq!(t.coord_type().unwrap(), CoordType::UV);
+    assert!(t.image_data().is_none());
+    assert!(t.tlut_data().is_none());
+}
+
+#[test]
+fn image_default_is_0x18_bytes_zero() {
+    let i = Image::allocate_default();
+    assert_eq!(i.0.borrow().len(), 0x18);
+    assert_eq!(i.width().unwrap(), 0);
+    assert_eq!(i.height().unwrap(), 0);
+    // GxTexFmt::I4 = 0 — that's what `from(0)` returns.
+    assert_eq!(i.format().unwrap(), GxTexFmt::I4);
+    assert_eq!(i.mipmap().unwrap(), 0);
+    assert!(i.image_data().is_none());
+}
+
+#[test]
+fn tobj_flag_nibble_setters_preserve_other_bits() {
+    let t = TObj::allocate_default();
+    t.set_flags(TObjFlags::BUMP).unwrap();          // bit 24
+    t.set_coord_type(CoordType::REFLECTION).unwrap(); // low 4 bits → 1
+    t.set_color_operation(ColorMap::BLEND).unwrap();   // bits 16-19 → 3
+    t.set_alpha_operation(AlphaMap::MODULATE).unwrap(); // bits 20-23 → 3
+
+    let raw = t.0.borrow().get_u32(0x40).unwrap();
+    // BUMP (1<<24) | (CoordType::REFLECTION = 1) | (BLEND << 16 = 3<<16)
+    // | (MODULATE << 20 = 3<<20)
+    let expected = (1u32 << 24) | 1u32 | (3u32 << 16) | (3u32 << 20);
+    assert_eq!(raw, expected);
+
+    // Re-readable through the typed accessors.
+    assert_eq!(t.coord_type().unwrap(), CoordType::REFLECTION);
+    assert_eq!(t.color_operation().unwrap(), ColorMap::BLEND);
+    assert_eq!(t.alpha_operation().unwrap(), AlphaMap::MODULATE);
+    assert!(t.flags().unwrap().intersects(TObjFlags::BUMP));
+}
+
+#[test]
+fn tobj_image_chain_round_trips() {
+    // Build a MObj with one TObj attached to texture0.  The TObj points
+    // at a fresh Image whose payload is 8 bytes of arbitrary GX-encoded
+    // data (we don't care about decode parity here — that's the H3
+    // encoder's job; this test just pins the *structural* round-trip).
+    let mobj = MObj::allocate_default();
+    mobj.set_render_flags(MaterialRenderMode::TEX0 | MaterialRenderMode::DIFFUSE)
+        .unwrap();
+
+    let tobj = TObj::allocate_default();
+    tobj.set_tex_map_id(GxTexMapId::GX_TEXMAP0).unwrap();
+    tobj.set_scale(1.0, 1.0, 1.0).unwrap();
+    tobj.set_wrap_s(GxWrapMode::REPEAT).unwrap();
+    tobj.set_wrap_t(GxWrapMode::CLAMP).unwrap();
+    tobj.set_repeat_s(1).unwrap();
+    tobj.set_repeat_t(2).unwrap();
+    tobj.set_blending(1.0).unwrap();
+    tobj.set_mag_filter(GxTexFilter::GX_LINEAR).unwrap();
+    tobj.set_coord_type(CoordType::UV).unwrap();
+    tobj.set_color_operation(ColorMap::MODULATE).unwrap();
+    tobj.set_alpha_operation(AlphaMap::MODULATE).unwrap();
+
+    let img = Image::allocate_default();
+    img.set_width(4).unwrap();
+    img.set_height(4).unwrap();
+    img.set_format(GxTexFmt::RGB565).unwrap();
+    img.set_min_lod(0.0).unwrap();
+    img.set_max_lod(0.0).unwrap();
+    // 4×4 RGB565 = 4*4*2 = 32 bytes.  Distinct values so dedup doesn't
+    // collapse this against another texture in the writer pass.
+    let payload: Vec<u8> = (0..32).map(|i| 0x40 + i as u8).collect();
+    img.set_image_data_bytes(payload.clone());
+
+    tobj.set_image_data(Some(img));
+    mobj.set_textures(Some(tobj));
+
+    let dat = round_trip(dat_with_mobj(mobj));
+    let mobj2 = extract_first_mobj(&dat);
+    let tobj2 = mobj2.textures().expect("TObj survives round-trip");
+    assert_eq!(tobj2.tex_map_id().unwrap(), GxTexMapId::GX_TEXMAP0);
+    assert!((tobj2.sx().unwrap() - 1.0).abs() < 1e-6);
+    assert_eq!(tobj2.wrap_s().unwrap(), GxWrapMode::REPEAT);
+    assert_eq!(tobj2.wrap_t().unwrap(), GxWrapMode::CLAMP);
+    assert_eq!(tobj2.repeat_s().unwrap(), 1);
+    assert_eq!(tobj2.repeat_t().unwrap(), 2);
+    assert_eq!(tobj2.coord_type().unwrap(), CoordType::UV);
+    assert_eq!(tobj2.color_operation().unwrap(), ColorMap::MODULATE);
+    assert_eq!(tobj2.alpha_operation().unwrap(), AlphaMap::MODULATE);
+    assert_eq!(tobj2.mag_filter().unwrap(), GxTexFilter::GX_LINEAR);
+
+    let img2 = tobj2.image_data().expect("Image survives round-trip");
+    assert_eq!(img2.width().unwrap(), 4);
+    assert_eq!(img2.height().unwrap(), 4);
+    assert_eq!(img2.format().unwrap(), GxTexFmt::RGB565);
+    let bytes = img2.image_data().expect("raw bytes survived");
+    assert_eq!(bytes, payload);
+}
+
+#[test]
+fn tobj_chain_two_textures_round_trips() {
+    // Wire two TObjs in a Next chain: texture 0 + texture 1 sharing the
+    // same MObj.  Common pattern for diffuse + lightmap rigging.
+    let mobj = MObj::allocate_default();
+    mobj.set_render_flags(
+        MaterialRenderMode::TEX0
+            | MaterialRenderMode::TEX1
+            | MaterialRenderMode::DIFFUSE,
+    )
+    .unwrap();
+
+    let make_tobj = |id: GxTexMapId, w: i16| {
+        let t = TObj::allocate_default();
+        t.set_tex_map_id(id).unwrap();
+        t.set_scale(1.0, 1.0, 1.0).unwrap();
+        let img = Image::allocate_default();
+        img.set_width(w).unwrap();
+        img.set_height(4).unwrap();
+        img.set_format(GxTexFmt::RGB565).unwrap();
+        let n = (w as usize) * 4 * 2;
+        let payload: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_add(w as u8)).collect();
+        img.set_image_data_bytes(payload);
+        t.set_image_data(Some(img));
+        t
+    };
+    let tobj0 = make_tobj(GxTexMapId::GX_TEXMAP0, 4);
+    let tobj1 = make_tobj(GxTexMapId::GX_TEXMAP1, 8);
+    tobj0.set_next(Some(tobj1));
+    mobj.set_textures(Some(tobj0));
+
+    let dat = round_trip(dat_with_mobj(mobj));
+    let mobj2 = extract_first_mobj(&dat);
+    let head = mobj2.textures().expect("TObj0");
+    assert_eq!(head.tex_map_id().unwrap(), GxTexMapId::GX_TEXMAP0);
+    assert_eq!(head.image_data().unwrap().width().unwrap(), 4);
+    let next = head.next().expect("TObj1 chain link");
+    assert_eq!(next.tex_map_id().unwrap(), GxTexMapId::GX_TEXMAP1);
+    assert_eq!(next.image_data().unwrap().width().unwrap(), 8);
+    assert!(next.next().is_none(), "chain ends after TObj1");
 }
 
 #[test]

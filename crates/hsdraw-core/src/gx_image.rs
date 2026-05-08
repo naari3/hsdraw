@@ -493,6 +493,282 @@ pub fn palette_to_rgba(format: GxTlutFmt, data: &[u8]) -> Vec<u8> {
     out
 }
 
+// =====================================================================
+// GX texture encoders.  Inverse of the per-format decoders above.
+// Tlut / paletted formats (CI4 / CI8 / CI14X2) are intentionally NOT
+// encoded — vanilla MKGP2 corpus shows zero hits across 7,812 textures
+// in 1,918 .dat files, so the addon can route those to RGB5A3 / RGB565
+// instead.  Adding palette quantization is mechanical when a use case
+// arrives.
+// =====================================================================
+
+/// Encode `rgba` (length = `4 * width * height`) into the GX-format
+/// byte stream `format` expects.  RGBA8 / RGB565 / RGB5A3 / CMP only;
+/// other formats return `HsdError::Malformed`.  Output dimensions are
+/// padded to the format's natural tile boundary (4 for the un-swizzled
+/// formats, 8 for CMP), so the byte count matches what the
+/// corresponding decoder reads.  CMP uses `texpresso`'s BC1 cluster-fit
+/// encoder (perceptual weights, no alpha-weighted clustering — matches
+/// HSDLib's "alpha-aware mode-0 fallback" except we always emit mode-1
+/// 4-color blocks since vanilla MKGP2 CMP textures don't carry punch-
+/// through alpha).
+pub fn encode_image(
+    format: GxTexFmt,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<Vec<u8>> {
+    if rgba.len() != (width as usize) * (height as usize) * 4 {
+        return Err(HsdError::malformed(
+            0,
+            "encode_image: RGBA buffer size mismatch",
+        ));
+    }
+    Ok(match format {
+        GxTexFmt::RGBA8 => to_rgba8(rgba, width, height),
+        GxTexFmt::RGB565 => to_rgb565(rgba, width, height),
+        GxTexFmt::RGB5A3 => to_rgb5a3(rgba, width, height),
+        GxTexFmt::CMP => to_cmp(rgba, width, height),
+        GxTexFmt::I4
+        | GxTexFmt::I8
+        | GxTexFmt::IA4
+        | GxTexFmt::IA8
+        | GxTexFmt::CI4
+        | GxTexFmt::CI8
+        | GxTexFmt::CI14X2
+        | GxTexFmt::Unknown(_) => {
+            return Err(HsdError::malformed(
+                0,
+                "encode_image: only RGBA8 / RGB565 / RGB5A3 / CMP are supported",
+            ));
+        }
+    })
+}
+
+/// Width padded up to a multiple of `align`.
+#[inline]
+fn pad_up(v: u32, align: u32) -> u32 {
+    (v + align - 1) & !(align - 1)
+}
+
+/// Read RGBA at (x, y), zero-filling pixels outside the source image
+/// (used to pad block-aligned writes when w/h aren't multiples of 4/8).
+#[inline]
+fn sample_rgba(rgba: &[u8], w: u32, h: u32, x: u32, y: u32) -> [u8; 4] {
+    if x < w && y < h {
+        let p = ((y * w + x) * 4) as usize;
+        [rgba[p], rgba[p + 1], rgba[p + 2], rgba[p + 3]]
+    } else {
+        [0, 0, 0, 0]
+    }
+}
+
+/// Inverse of [`from_rgba8`].  Output is `(w_pad * h_pad * 4)` bytes,
+/// where dimensions are padded up to a multiple of 4.  Each 4x4 tile
+/// emits two passes: pass 0 = AR pairs (alpha high, red low), pass 1 =
+/// GB pairs.
+fn to_rgba8(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(w, 4);
+    let h_pad = pad_up(h, 4);
+    let mut out = vec![0u8; (w_pad * h_pad * 4) as usize];
+    let mut outp = 0usize;
+    for y in (0..h_pad).step_by(4) {
+        for x in (0..w_pad).step_by(4) {
+            for k in 0..2u32 {
+                for y1 in y..y + 4 {
+                    for x1 in x..x + 4 {
+                        let [r, g, b, a] = sample_rgba(rgba, w, h, x1, y1);
+                        let pixel: u16 = if k == 0 {
+                            ((a as u16) << 8) | (r as u16)
+                        } else {
+                            ((g as u16) << 8) | (b as u16)
+                        };
+                        out[outp..outp + 2].copy_from_slice(&pixel.to_be_bytes());
+                        outp += 2;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`from_rgb565`].  HSDLib's RGB565 labels the high 5 bits
+/// as "b" and low 5 as "r" (see `from_rgb565`); we mirror that exactly
+/// so encode→decode is byte-identical for any RGB565-representable
+/// input.  Channels are quantized via round-half-up: for an N-bit
+/// channel, `c_n = (c8 * (2^N - 1) + 127) / 255`.
+fn to_rgb565(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(w, 4);
+    let h_pad = pad_up(h, 4);
+    let mut out = vec![0u8; (w_pad * h_pad * 2) as usize];
+    let mut outp = 0usize;
+    for y in (0..h_pad).step_by(4) {
+        for x in (0..w_pad).step_by(4) {
+            for y1 in y..y + 4 {
+                for x1 in x..x + 4 {
+                    let [r, g, b, _a] = sample_rgba(rgba, w, h, x1, y1);
+                    // High 5 bits = "b" channel (HSDLib quirk), mid 6 = g, low 5 = r.
+                    let r5 = quantize(r, 31);
+                    let g6 = quantize(g, 63);
+                    let b5 = quantize(b, 31);
+                    let pixel: u16 = ((b5 as u16) << 11)
+                        | ((g6 as u16) << 5)
+                        | (r5 as u16);
+                    out[outp..outp + 2].copy_from_slice(&pixel.to_be_bytes());
+                    outp += 2;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`from_rgb5a3`].  The 1-bit branch is driven by alpha:
+/// alpha == 0xFF emits the RGB555 form (top bit set, 5/5/5 channels);
+/// any other alpha value emits the RGB4A3 form (top bit clear, 3-bit
+/// alpha + 4/4/4 channels).  Mid-range alpha values quantize via the
+/// same round-half-up formula as RGB565.
+fn to_rgb5a3(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(w, 4);
+    let h_pad = pad_up(h, 4);
+    let mut out = vec![0u8; (w_pad * h_pad * 2) as usize];
+    let mut outp = 0usize;
+    for y in (0..h_pad).step_by(4) {
+        for x in (0..w_pad).step_by(4) {
+            for y1 in y..y + 4 {
+                for x1 in x..x + 4 {
+                    let [r, g, b, a] = sample_rgba(rgba, w, h, x1, y1);
+                    let pixel: u16 = if a == 0xFF {
+                        // RGB555: top bit set, no alpha.  HSDLib labels
+                        // bits 14-10 as "b", 9-5 as "g", 4-0 as "r"
+                        // (see `decode_rgb5a3`).
+                        let r5 = quantize(r, 31);
+                        let g5 = quantize(g, 31);
+                        let b5 = quantize(b, 31);
+                        (1u16 << 15)
+                            | ((b5 as u16) << 10)
+                            | ((g5 as u16) << 5)
+                            | (r5 as u16)
+                    } else {
+                        // RGB4A3: top bit clear, 3-bit alpha at bits
+                        // 14-12, 4-bit b/g/r at 11-8 / 7-4 / 3-0.
+                        let a3 = quantize(a, 7);
+                        let r4 = quantize(r, 15);
+                        let g4 = quantize(g, 15);
+                        let b4 = quantize(b, 15);
+                        ((a3 as u16) << 12)
+                            | ((b4 as u16) << 8)
+                            | ((g4 as u16) << 4)
+                            | (r4 as u16)
+                    };
+                    out[outp..outp + 2].copy_from_slice(&pixel.to_be_bytes());
+                    outp += 2;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Round-half-up quantize an 8-bit channel to `levels`-step (N-bit:
+/// `levels = 2^N - 1`).  Inverse-friendly with HSDLib's
+/// `c8 = c_n * 255 / levels` integer-floor decoder formula: encoding
+/// the decoder's output recovers the original `c_n` for every input.
+#[inline]
+fn quantize(c8: u8, levels: u32) -> u8 {
+    (((c8 as u32) * levels + 127) / 255) as u8
+}
+
+/// Inverse of [`from_cmp`].  CMP / DXT1 with three GX-specific
+/// transforms applied on top of `texpresso`'s standard PC-DXT1 output:
+///   1. Endpoint byte-swap: GX stores the two RGB565 endpoint words
+///      big-endian; texpresso emits them little-endian.
+///   2. Index bit-reversal: GX packs the 16 2-bit indices MSB-first
+///      within each index byte (bits 6-7 = index 0, 4-5 = index 1, …).
+///      Texpresso uses LSB-first — same bytes after reversing each
+///      pair within each byte.
+///   3. 8x8 super-block swizzle: GX groups 4 4x4 blocks into a 32-byte
+///      super-block laid out (top-left, top-right, bottom-left,
+///      bottom-right) at offsets (0, 8, 16, 24); super-blocks then run
+///      left-to-right, top-to-bottom.  Padded to 8 in both dimensions.
+///
+/// We force `Format::Bc1` 4-color mode (no punch-through alpha branch
+/// — every output block has `c0 > c1`).  Texpresso's `write4` already
+/// guarantees this, so no extra check is needed.
+fn to_cmp(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(pad_up(w, 4), 8);
+    let h_pad = pad_up(pad_up(h, 4), 8);
+    let bpp_2 = (w_pad * h_pad / 2) as usize;
+
+    // Build a padded RGBA source covering the full w_pad × h_pad area;
+    // texpresso reads contiguous row-major data and computes per-block
+    // bounds against (w_pad, h_pad), so we copy in the visible region
+    // and zero-fill the rest.  A 16x16 typical case adds ~256 bytes of
+    // copy — cheap for what we get (no bounds-special-casing in the
+    // BC1 path itself).
+    let mut padded: Vec<u8> = vec![0u8; (w_pad * h_pad * 4) as usize];
+    for y in 0..h {
+        let src_off = (y * w * 4) as usize;
+        let dst_off = (y * w_pad * 4) as usize;
+        let row_len = (w * 4) as usize;
+        padded[dst_off..dst_off + row_len]
+            .copy_from_slice(&rgba[src_off..src_off + row_len]);
+    }
+
+    // texpresso emits PC-DXT1: blocks in row-major order, w_pad/4 blocks
+    // per row, h_pad/4 block rows.  Total = w_pad*h_pad/2 bytes.
+    let mut tex_out = vec![0u8; bpp_2];
+    texpresso::Format::Bc1.compress(
+        &padded,
+        w_pad as usize,
+        h_pad as usize,
+        texpresso::Params::default(),
+        &mut tex_out,
+    );
+
+    // Apply the three GX transforms.  We lay out blocks via the same
+    // 8x8 super-block formula `from_cmp` reads them with: each 4x4 block
+    // at GX offset = 8*x1 + 16*y1 + 32*x2 + 4*ww*y2 (where (x2, y2) is
+    // the super-block index, (x1, y1) is the in-super 0..1 sub-index).
+    let mut out = vec![0u8; bpp_2];
+    let blocks_per_row = (w_pad / 4) as usize;
+    for by in 0..(h_pad / 4) {
+        for bx in 0..(w_pad / 4) {
+            let pc_off = (by as usize * blocks_per_row + bx as usize) * 8;
+            let pc_block = &tex_out[pc_off..pc_off + 8];
+
+            // GX 8x8 super-block swizzle: split (bx, by) into (x1, x2)
+            // and (y1, y2) and reassemble.
+            let x1 = (bx & 1) as u32;
+            let y1 = (by & 1) as u32;
+            let x2 = bx >> 1;
+            let y2 = by >> 1;
+            let gx_off = (8 * x1 + 16 * y1 + 32 * x2 + 4 * w_pad * y2) as usize;
+
+            // Endpoint #0 (bytes 0..2), endpoint #1 (bytes 2..4):
+            // swap the byte order LE→BE for each.
+            out[gx_off + 0] = pc_block[1];
+            out[gx_off + 1] = pc_block[0];
+            out[gx_off + 2] = pc_block[3];
+            out[gx_off + 3] = pc_block[2];
+
+            // Indices (bytes 4..8): GX packs index 0 in bits 6-7 of the
+            // first byte, PC packs it in bits 0-1.  Reversing the four
+            // 2-bit fields within each byte does the conversion.
+            for i in 0..4usize {
+                let pc_byte = pc_block[4 + i];
+                out[gx_off + 4 + i] = ((pc_byte & 0x03) << 6)
+                    | ((pc_byte & 0x0C) << 2)
+                    | ((pc_byte & 0x30) >> 2)
+                    | ((pc_byte & 0xC0) >> 6);
+            }
+        }
+    }
+
+    out
+}
+
 /// Encode RGBA8 bytes into a minimal PNG (IHDR + IDAT + IEND only — no
 /// gAMA/pHYs/sBIT chunks).  `png` crate's default Encoder satisfies that
 /// when we don't ask for anything extra.

@@ -52,6 +52,7 @@ straight into Python without bringing project-specific schemas (e.g.
 | `HsdStruct.byte_size()` / `.raw()`      | `_s.Length` / `_s.GetData()`                              | introspection       |
 | `HsdStruct.references() -> [(off, target)]` | `_s.References`                                       | walk raw refs       |
 | `HsdStruct.get_reference(offset)`       | `_s.GetReference<HSDAccessor>(offset)` (sans typed cast)  | offset lookup       |
+| `HsdStruct.set_reference(offset, target_or_None)` | `_s.SetReference(offset, target)`                | deep-field repoint  |
 | `__eq__` / `__hash__` on JObj/HsdStruct | `obj._s == other._s` / `RuntimeHelpers.GetHashCode(_s)`   | identity comparison |
 
 ## Quick reference

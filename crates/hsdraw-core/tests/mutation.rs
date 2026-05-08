@@ -349,6 +349,60 @@ fn jobj_identity_via_rc_clone() {
 // the JOBJDescs[] array out of scene_data).
 // =====================================================================
 
+// =====================================================================
+// HsdStruct::set_reference — deep-field repoint via raw struct setter.
+// Mirrors HSDLib `HSDStruct.SetReference(offset, target)`.  Needed by
+// callers that have to repoint typed sub-fields without a typed
+// accessor for the layout (e.g. `HSD_SOBJ.JOBJDescs[0].RootJoint = …`,
+// which is what mkgp2-patch's `vis:` → fresh-course pipeline does at
+// the splice point).
+//
+// The PyO3 binding's `PyHsdStruct.set_reference` is a thin wrapper
+// over this same Rust API, so pinning the round-trip here also pins
+// the Python-side contract.
+// =====================================================================
+
+#[test]
+fn primitive_set_reference_deep_field_repoint_round_trips() {
+    let dat = build_synthetic_tree();
+
+    // The synthetic root joint is tagged tx=1.0; build a replacement
+    // tagged tx=99.0 so we can tell them apart after re-parse.
+    let new_root = JObj::allocate_default();
+    new_root.set_tx(99.0).unwrap();
+
+    // Walk SOBJ → JOBJDescs[] → JObjDesc[0] without using the SObj
+    // typed view, the way an addon would.
+    let scene = dat.scene_data().expect("scene_data root");
+    let descs_arr = scene
+        .data
+        .borrow()
+        .get_reference(0)
+        .expect("SOBJ.JOBJDescs[] ref");
+    let jobj_desc = descs_arr
+        .borrow()
+        .get_reference(0)
+        .expect("JOBJDescs[0] ref");
+
+    // Deep-field repoint: HSD_JOBJDesc.RootJoint sits at offset 0x00.
+    jobj_desc
+        .borrow_mut()
+        .set_reference(0x00, Some(new_root.0.clone()));
+
+    let written = dat.write().expect("write");
+    let dat2 = Dat::parse(&written).expect("reparse");
+
+    // After round-trip the descriptor's RootJoint must point at a
+    // joint whose TRS matches the new joint, not the old root.
+    let scene2 = dat2.scene_data().expect("scene_data after reparse");
+    let sobj2 = SObj::from_struct(scene2.data.clone());
+    let descs2 = sobj2.jobj_descs();
+    let root2 = descs2[0]
+        .root_joint()
+        .expect("root joint after repoint");
+    assert!((root2.tx().unwrap() - 99.0).abs() < 1e-6);
+}
+
 #[test]
 fn synthetic_struct_references_enumerate() {
     let dat = build_synthetic_tree();

@@ -20,7 +20,7 @@ side mesh data, and serialize back — all without depending on
 | **PyO3** | abi3-py37 wheel covers Python 3.7+; identity-aware `__eq__` / `__hash__` on every typed view |
 | **CI** | `cargo test` on Linux / macOS / Windows + 5-platform abi3 wheel matrix via maturin |
 
-Test totals: **51 passing** env-free (18 unit + 10 mutation primitive +
+Test totals: **52 passing** env-free (18 unit + 11 mutation primitive +
 4 parity + 14 POBJ writer round-trip + 5 MObj / Material / PeDesc
 round-trip).  With `MKGP2_FILES_DIR` + `MKGP2_PATCH_DIR` set, an
 additional 6 csx-parity courses + 9-file writer round-trip corpus run.
@@ -35,7 +35,7 @@ additional 6 csx-parity courses + 9-file writer round-trip corpus run.
 | `MObj` | `alloc`, `alloc_unlit_color`, `set_material`, `set_textures`, `set_pe_desc`, `render_flags` |
 | `Material` | `alloc`, `{amb,dif,spc}_rgba`, `alpha`, `shininess` |
 | `PeDesc` | `alloc`, `blend_mode`, `src_factor`, `dst_factor`, `depth_function`, `alpha_*`, … |
-| `HsdStruct` | `byte_size`, `raw`, `references`, `get_reference` |
+| `HsdStruct` | `byte_size`, `raw`, `references`, `get_reference`, `set_reference` |
 
 These mirror HSDLib's accessor / setter pairs at the byte-offset level;
 nothing here carries project-specific schemas.  See
@@ -107,7 +107,7 @@ manually via **Actions → wheels → Run workflow** or push a `v*` tag.
 
 ```bash
 cargo test --workspace
-# → 51 PASS, env-free
+# → 52 PASS, env-free
 ```
 
 For the corpus comparisons (requires `dotnet-script` on PATH plus a

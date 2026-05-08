@@ -247,6 +247,24 @@ impl PyHsdStruct {
             .map(|s| PyHsdStruct { inner: s })
     }
 
+    /// Set or clear a reference at `offset`.  Pass `None` to detach.
+    /// Mirrors HSDLib `HSDStruct.SetReference(offset, target)`.
+    /// Needed for callers that have to repoint deep typed-struct
+    /// fields (e.g. `HSD_SOBJ.JOBJDescs[0].RootJoint = new_jobj`)
+    /// without a typed accessor for every layout.  Accepts a
+    /// `HsdStruct` or any of the typed-view classes (JObj / DObj /
+    /// MObj / Material / PeDesc / Pobj) thanks to
+    /// `struct_ref_from_any`.
+    #[pyo3(signature = (offset, target = None))]
+    fn set_reference(&self, offset: u32, target: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let resolved = match target {
+            None => None,
+            Some(any) => Some(struct_ref_from_any(any)?),
+        };
+        self.inner.borrow_mut().set_reference(offset, resolved);
+        Ok(())
+    }
+
     /// True iff `self` and `other` share the same underlying Rc.  Same
     /// semantics as `is` in Python — exposed explicitly because PyO3
     /// classes default `__eq__` to value equality on string repr,

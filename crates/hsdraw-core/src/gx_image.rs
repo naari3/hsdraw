@@ -235,18 +235,22 @@ fn from_rgb5a3(tpl: &[u8], w: u32, h: u32) -> Vec<u8> {
 }
 
 fn decode_rgb5a3(pixel: u16) -> (u8, u8, u8, u8) {
+    // HSDLib labels: top bits are "b", bottom bits are "r".  We mirror that
+    // exact assignment so byte 0 of the output (= "r") carries the same bits
+    // csx writes via HSDLib's `(r << 0) | (g << 8) | (b << 16) | (a << 24)`
+    // little-endian dump.  RGB565 in this file follows the same convention.
     if pixel & (1 << 15) != 0 {
         // RGB555
-        let r = ((((pixel >> 10) & 0x1F) as u32 * 255 / 31) & 0xff) as u8;
+        let b = ((((pixel >> 10) & 0x1F) as u32 * 255 / 31) & 0xff) as u8;
         let g = ((((pixel >> 5) & 0x1F) as u32 * 255 / 31) & 0xff) as u8;
-        let b = (((pixel & 0x1F) as u32 * 255 / 31) & 0xff) as u8;
+        let r = (((pixel & 0x1F) as u32 * 255 / 31) & 0xff) as u8;
         (255, r, g, b)
     } else {
         // RGB4A3
         let a = ((((pixel >> 12) & 0x07) as u32 * 255 / 7) & 0xff) as u8;
-        let r = ((((pixel >> 8) & 0x0F) as u32 * 255 / 15) & 0xff) as u8;
+        let b = ((((pixel >> 8) & 0x0F) as u32 * 255 / 15) & 0xff) as u8;
         let g = ((((pixel >> 4) & 0x0F) as u32 * 255 / 15) & 0xff) as u8;
-        let b = (((pixel & 0x0F) as u32 * 255 / 15) & 0xff) as u8;
+        let r = (((pixel & 0x0F) as u32 * 255 / 15) & 0xff) as u8;
         (a, r, g, b)
     }
 }

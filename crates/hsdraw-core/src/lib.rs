@@ -9,6 +9,7 @@ pub mod accessor;
 pub mod common;
 pub mod dat;
 pub mod error;
+pub mod export;
 pub mod gx;
 pub mod gx_dl;
 pub mod gx_image;

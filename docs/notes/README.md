@@ -5,6 +5,7 @@
 | ファイル | 内容 |
 |---|---|
 | `phase0.md` | Phase 0 の format reading 結果。HSDLib/csx を読み下した一次解釈。Phase 1 以降のすべての実装はここの解釈を ground truth として参照 |
+| `phase4.md` | Phase 4 の parity harness 構成・落とし穴 (RGB5A3 の HSDLib 変数命名と byte order)・PyO3 surface |
 
 参照元 path:
 

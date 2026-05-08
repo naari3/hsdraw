@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use hsdraw_core::accessor::{Accessor, id_of};
 use hsdraw_core::common::{DObj, JObj, MObj, PObj, SObj, TObj};
 use hsdraw_core::error::HsdError;
+use hsdraw_core::export;
 use hsdraw_core::gx::{jobj_flag_names, render_flag_names};
 use hsdraw_core::gx_dl;
 use hsdraw_core::gx_image;
@@ -60,16 +61,38 @@ fn decode(path: &PathBuf, out: Option<&Path>) -> Result<()> {
     println!("References: {}", dat.references.len());
     println!("Structs: {}", dat.struct_order.len());
 
-    let tex_dir = match out {
-        Some(o) => {
-            let d = o.join("tex");
-            fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
-            Some(d)
-        }
-        None => None,
-    };
+    // When --out is given, drive the canonical csx-equivalent exporter.
+    // The tree dump path below stays available for sanity checking; the
+    // exporter and the dump are independent walks of the same Rc tree.
+    if let Some(out_dir) = out {
+        fs::create_dir_all(out_dir)
+            .with_context(|| format!("mkdir {}", out_dir.display()))?;
+        let tex_dir = out_dir.join("tex");
+        let source_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unknown>")
+            .to_owned();
+        let scene = export::export_scene(&dat, source_name, Some(&tex_dir))?;
+        let json = serde_json::to_string(&scene)
+            .with_context(|| "serde_json::to_string failed")?;
+        let json_path = out_dir.join("scene.json");
+        fs::write(&json_path, json.as_bytes())
+            .with_context(|| format!("write {}", json_path.display()))?;
+        println!("\nWrote: {}", json_path.display());
+        println!("  textures: {}", scene.textures.len());
+        println!("  materials: {}", scene.materials.len());
+        println!(
+            "  joints: {} (aliases: {})",
+            scene.joints.len(),
+            scene.joint_aliases.len()
+        );
+        println!("  meshes: {}", scene.meshes.len());
+        return Ok(());
+    }
 
-    let mut tex_state = TextureExport::new(tex_dir);
+    let tex_state_dir: Option<PathBuf> = None;
+    let mut tex_state = TextureExport::new(tex_state_dir);
     println!();
 
     let mut visited: HashSet<*const std::cell::RefCell<hsdraw_core::HsdStruct>> = HashSet::new();

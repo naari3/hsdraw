@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 hsdraw-core = { path = "../hsdraw-core" }
 pyo3 = { version = "0.28.3", features = ["abi3-py37", "extension-module"] }
+serde_json = "1.0.149"
 
 [lints]
 workspace = true

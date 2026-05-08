@@ -373,99 +373,116 @@ plain_enum!(GxCompType, u32, {
 /// that behavior so parity tests stay happy.
 pub fn render_flag_names(flags: MaterialRenderMode) -> Vec<&'static str> {
     let bits = flags.bits();
-    // Order chosen so the resulting `, `-join matches HSDLib's
-    // `Enum.ToString()` flag-output order, which iterates members in
-    // declaration order and emits *one* name per matching value (not per
-    // bit).  ALPHA_BOTH (= bits 13|14 set together) wins over the
-    // individual ALPHA_MAT/ALPHA_VTX names; CONSTANT|VERTEX collapses to
-    // BOTH the same way.  Once a composite name fires we mask out its
-    // bits so the per-bit pass below doesn't double-emit.
-    //
-    // Composite priorities (must come first, ordered by bit position):
-    let mut consumed = 0u32;
-    let mut out = Vec::new();
-    let composites: &[(u32, &str)] = &[
-        ((1 << 0) | (1 << 1), "BOTH"),         // CONSTANT | VERTEX
-        ((1 << 13) | (2 << 13), "ALPHA_BOTH"), // ALPHA_MAT | ALPHA_VTX
-    ];
-    for (mask, name) in composites {
-        if bits & mask == *mask {
-            out.push(*name);
-            consumed |= mask;
-        }
-    }
-
-    // Per-bit names in HSDLib enum declaration order.
+    // Sorted descending for the greedy decomposition that C#
+    // `[Flags]` ToString runs.  Composites (BOTH = CONSTANT | VERTEX,
+    // ALPHA_BOTH = ALPHA_MAT | ALPHA_VTX) come before their constituent
+    // bits so a fully-set sub-field collapses to the composite name.
     let table: &[(u32, &str)] = &[
-        (1 << 0, "CONSTANT"),
-        (1 << 1, "VERTEX"),
-        (1 << 2, "DIFFUSE"),
-        (1 << 3, "SPECULAR"),
-        (1 << 4, "TEX0"),
-        (1 << 5, "TEX1"),
-        (1 << 6, "TEX2"),
-        (1 << 7, "TEX3"),
-        (1 << 8, "TEX4"),
-        (1 << 9, "TEX5"),
-        (1 << 10, "TEX6"),
-        (1 << 11, "TEX7"),
-        (1 << 12, "TOON"),
-        (1 << 13, "ALPHA_MAT"),
-        (2 << 13, "ALPHA_VTX"),
-        (1 << 24, "ZOFST"),
-        (1 << 25, "EFFECT"),
-        (1 << 26, "SHADOW"),
-        (1 << 27, "ZMODE_ALWAYS"),
-        (1 << 28, "DF_ALL"),
-        (1 << 29, "NO_ZUPDATE"),
-        (1 << 30, "XLU"),
         (1 << 31, "USER"),
+        (1 << 30, "XLU"),
+        (1 << 29, "NO_ZUPDATE"),
+        (1 << 28, "DF_ALL"),
+        (1 << 27, "ZMODE_ALWAYS"),
+        (1 << 26, "SHADOW"),
+        (1 << 25, "EFFECT"),
+        (1 << 24, "ZOFST"),
+        (3 << 13, "ALPHA_BOTH"),
+        (2 << 13, "ALPHA_VTX"),
+        (1 << 13, "ALPHA_MAT"),
+        (1 << 12, "TOON"),
+        (1 << 11, "TEX7"),
+        (1 << 10, "TEX6"),
+        (1 << 9, "TEX5"),
+        (1 << 8, "TEX4"),
+        (1 << 7, "TEX3"),
+        (1 << 6, "TEX2"),
+        (1 << 5, "TEX1"),
+        (1 << 4, "TEX0"),
+        (1 << 3, "SPECULAR"),
+        (1 << 2, "DIFFUSE"),
+        (3, "BOTH"), // CONSTANT | VERTEX
+        (1 << 1, "VERTEX"),
+        (1 << 0, "CONSTANT"),
     ];
-    for (mask, name) in table {
-        if bits & mask == *mask && (consumed & mask) == 0 {
-            out.push(*name);
-            consumed |= mask;
-        }
-    }
-    out
+    // RENDER_MODE has no named-zero member, so a 0-valued flag set yields
+    // the empty list — csx's `Split(", ").Where(!IsNullOrWhiteSpace)`
+    // collapses the bare `"0"` from C#'s ToString to the same empty list.
+    flag_names_for(bits, table, None)
 }
 
-/// `JObjFlag` flag-name list, ordered to match HSDLib's
-/// `Enum.ToString()` output for parity export.
+/// `JObjFlag` flag-name list, formatted to match `Enum.ToString()` on the
+/// C# side.  See `flag_names_for` for the algorithm; .NET emits the named
+/// 0 value when the integer is exactly 0 (here: `"NULL"`), uses greedy
+/// descending decomposition for composite multi-bit fields like JOINT1/2/
+/// EFFECTOR and BILLBOARD/V/H/R, and finally outputs the matched names in
+/// ascending numeric order.
 pub fn jobj_flag_names(flags: JObjFlag) -> Vec<&'static str> {
     let bits = flags.bits();
+    // (mask, name), sorted DESCENDING for greedy-match.  Composites
+    // (EFFECTOR=3<<21, HBILLBOARD=3<<9, etc.) come before the single-bit
+    // entries that they would otherwise mask.
     let table: &[(u32, &str)] = &[
-        (1 << 0, "SKELETON"),
-        (1 << 1, "SKELETON_ROOT"),
-        (1 << 2, "ENVELOPE_MODEL"),
-        (1 << 3, "CLASSICAL_SCALING"),
-        (1 << 4, "HIDDEN"),
-        (1 << 5, "PTCL"),
-        (1 << 6, "MTX_DIRTY"),
-        (1 << 7, "LIGHTING"),
-        (1 << 8, "TEXGEN"),
-        (1 << 9, "BILLBOARD"),
-        (1 << 12, "INSTANCE"),
-        (1 << 13, "PBILLBOARD"),
-        (1 << 14, "SPLINE"),
-        (1 << 15, "FLIP_IK"),
-        (1 << 16, "SPECULAR"),
-        (1 << 17, "USE_QUATERNION"),
-        (1 << 18, "OPA"),
-        (1 << 19, "XLU"),
-        (1 << 20, "TEXEDGE"),
-        (1 << 23, "USER_DEFINED_MTX"),
-        (1 << 24, "MTX_INDEPEND_PARENT"),
-        (1 << 25, "MTX_INDEPEND_SRT"),
-        (1 << 28, "ROOT_OPA"),
-        (1 << 29, "ROOT_XLU"),
         (1 << 30, "ROOT_TEXEDGE"),
+        (1 << 29, "ROOT_XLU"),
+        (1 << 28, "ROOT_OPA"),
+        (1 << 25, "MTX_INDEPEND_SRT"),
+        (1 << 24, "MTX_INDEPEND_PARENT"),
+        (1 << 23, "USER_DEFINED_MTX"),
+        (3 << 21, "EFFECTOR"),
+        (2 << 21, "JOINT2"),
+        (1 << 21, "JOINT1"),
+        (1 << 20, "TEXEDGE"),
+        (1 << 19, "XLU"),
+        (1 << 18, "OPA"),
+        (1 << 17, "USE_QUATERNION"),
+        (1 << 16, "SPECULAR"),
+        (1 << 15, "FLIP_IK"),
+        (1 << 14, "SPLINE"),
+        (1 << 13, "PBILLBOARD"),
+        (1 << 12, "INSTANCE"),
+        (4 << 9, "RBILLBOARD"),
+        (3 << 9, "HBILLBOARD"),
+        (2 << 9, "VBILLBOARD"),
+        (1 << 9, "BILLBOARD"),
+        (1 << 8, "TEXGEN"),
+        (1 << 7, "LIGHTING"),
+        (1 << 6, "MTX_DIRTY"),
+        (1 << 5, "PTCL"),
+        (1 << 4, "HIDDEN"),
+        (1 << 3, "CLASSICAL_SCALING"),
+        (1 << 2, "ENVELOPE_MODEL"),
+        (1 << 1, "SKELETON_ROOT"),
+        (1 << 0, "SKELETON"),
     ];
-    let mut out = Vec::new();
+    flag_names_for(bits, table, Some("NULL"))
+}
+
+/// Greedy-match against `table` (entries sorted DESCENDING), then reverse
+/// the result so the output is in ascending numeric value — exactly the
+/// order C# `[Flags]` `Enum.ToString()` produces.  When `bits == 0` and
+/// `zero_name` is `Some(n)`, returns `vec![n]`.
+pub fn flag_names_for(
+    bits: u32,
+    table: &[(u32, &'static str)],
+    zero_name: Option<&'static str>,
+) -> Vec<&'static str> {
+    if bits == 0 {
+        return match zero_name {
+            Some(n) => vec![n],
+            None => Vec::new(),
+        };
+    }
+    let mut remaining = bits;
+    let mut names: Vec<&'static str> = Vec::new();
     for (mask, name) in table {
-        if bits & mask != 0 {
-            out.push(*name);
+        if (remaining & mask) == *mask {
+            names.push(*name);
+            remaining &= !mask;
+            if remaining == 0 {
+                break;
+            }
         }
     }
-    out
+    names.reverse();
+    names
 }

@@ -49,6 +49,19 @@ straight into Python without bringing project-specific schemas (e.g.
 | `MObj.render_flags` getter/setter       | `m.RenderFlags` (RENDER_MODE)                             | flag bits           |
 | `Material.alloc()` + `.{amb,dif,spc}_rgba` + `.alpha` + `.shininess` | `new HSD_Material { … }`              | material colors     |
 | `PeDesc.alloc()` + per-byte setters     | `new HSD_PEDesc { BlendMode=…, … }`                      | PE descriptor       |
+| `Dat.alloc_scene_data() -> Dat`         | `new HSDRawFile()` + manual SOBJ tree                     | from-scratch synthesis |
+| `SObj.alloc()` / `.from_struct(s)`      | `new HSD_SOBJ()` / `(HSD_SOBJ) s`                         | scene-object alloc / view |
+| `SObj.jobj_descs() -> [JObjDesc]`       | `sobj.JOBJDescs.Array`                                    | enumerate descriptors |
+| `SObj.set_jobj_descs([JObjDesc, …])`    | `sobj.JOBJDescs = HSDNullPointerArrayAccessor.From(…)`    | replace descriptor list |
+| `SObj.jobj_descs_array() -> HsdStruct?` | `sobj.JOBJDescs._s`                                       | raw array struct    |
+| `JObjDesc.alloc()` / `.from_struct(s)`  | `new HSD_JOBJDesc()` / `(HSD_JOBJDesc) s`                 | descriptor alloc / view |
+| `JObjDesc.root_joint` / `.set_root_joint(j)` | `desc.RootJoint` / `= j`                             | per-descriptor root |
+| `TObj.alloc()` + per-field setters      | `new HSD_TOBJ { … }`                                      | texture-object alloc |
+| `TObj.set_image_data(img)` / `.set_tlut_data(t)` | `tobj.ImageData = …` / `.TLUTData = …`           | image / palette refs |
+| `TObj.set_coord_type(c)` / `.set_color_operation(o)` / `.set_alpha_operation(o)` | `tobj.CoordType=` / `.ColorOperation=` / `.AlphaOperation=` (nibble-preserving) | flag nibbles |
+| `Image.alloc()` + `.set_image_data_bytes(b)` | `new HSD_Image { ImageData = HSDStruct(b) }`         | image alloc + payload |
+| `Image.{width,height,format,mipmap,min_lod,max_lod}` | `img.Width` / `.Height` / `.Format` / `.MipMap` / `.LODBias` / `.MaxLOD` | per-field setters |
+| `hsdraw.gx_encode(format, w, h, rgba) -> bytes` | `GXImageConverter.EncodeImage(GX_TF_*, w, h, rgba)` | RGBA8 → GX bytes encoder (RGBA8 / RGB565 / RGB5A3 / CMP only) |
 | `HsdStruct.byte_size()` / `.raw()`      | `_s.Length` / `_s.GetData()`                              | introspection       |
 | `HsdStruct.references() -> [(off, target)]` | `_s.References`                                       | walk raw refs       |
 | `HsdStruct.get_reference(offset)`       | `_s.GetReference<HSDAccessor>(offset)` (sans typed cast)  | offset lookup       |
@@ -66,6 +79,11 @@ straight into Python without bringing project-specific schemas (e.g.
   verified against csx `hsd_export_for_blender.csx`).
 - `hsdraw.write_dat(bytes, optimize=True, buffer_align=True) -> bytes`
   — same as `Dat.write()` for callers that don't want to hold a `Dat`.
+- `hsdraw.gx_encode(format, width, height, rgba) -> bytes` —
+  RGBA8 → GX-format byte payload.  `format` is the `GxTexFmt` integer
+  (4=RGB565, 5=RGB5A3, 6=RGBA8, 14=CMP); other values raise
+  `ValueError`.  Output is padded to the format's natural tile
+  boundary; feed it into `Image.set_image_data_bytes(...)`.
 
 ### Mutation primitives
 
@@ -257,6 +275,56 @@ pobj = mesh.build()
 # Wire as before via DObj / JObj attach.
 ```
 
+## End-to-end example: from-scratch synthesis (no base .dat)
+
+`Dat.alloc_scene_data()` produces an empty SObj → JOBJDescs[1] →
+JObjDesc → root JObj scaffold; from there you wire DObjs, MObjs,
+TObjs, and Images yourself.  Useful for the vanilla-independent
+export pipeline (no base file to start from):
+
+```python
+import hsdraw
+
+dat  = hsdraw.Dat.alloc_scene_data()
+sobj = hsdraw.SObj.from_struct(dat.scene_data().data)
+root = sobj.jobj_descs()[0].root_joint           # placeholder JObj
+
+# ---- encode a 4×4 RGBA8 source into RGB565 GX bytes ----------------
+src = bytes(b"\x40\x80\xC0\xFF" * (4 * 4))        # solid teal
+gx  = hsdraw.gx_encode(4, 4, 4, src)              # format 4 = RGB565
+assert len(gx) == 32
+
+# ---- build the material chain --------------------------------------
+img = hsdraw.Image.alloc()
+img.width  = 4
+img.height = 4
+img.format = 4                                    # RGB565
+img.set_image_data_bytes(gx)
+
+tobj = hsdraw.TObj.alloc()
+tobj.tex_map_id = 0                               # GX_TEXMAP0
+tobj.set_scale(1.0, 1.0, 1.0)
+tobj.set_image_data(img)
+
+mobj = hsdraw.MObj.alloc_unlit_color(0xFF, 0xFF, 0xFF, 0xFF)
+mobj.set_textures(tobj)
+
+dobj = hsdraw.DObj.alloc()
+dobj.set_mobj(mobj)
+root.set_dobj(dobj)
+
+# Add some POBJ via MeshBuilder if you want geometry too — see the
+# Phase 1 example above.
+
+open("from_scratch.dat", "wb").write(dat.write())
+```
+
+The chain `Dat.alloc_scene_data → ... → Image.set_image_data_bytes`
+covers everything an addon needs to produce a self-contained .dat
+without holding a vanilla base file.  See
+`crates/hsdraw-core/tests/from_scratch.rs` for the round-trip
+verification path the CI gates on.
+
 ## Limitations (deliberate non-goals)
 
 This binding is the HSDLib surface, not the Blender add-on surface.
@@ -265,12 +333,11 @@ The following stay out of `hsdraw` core:
 - **`scene.json` schema** — that's `mkgp2-patch`'s convention and
   belongs in the add-on.  The add-on builds its `jobj_id → JObj` map,
   iterates the JSON, and calls the primitives above.
-- **Material / DObj / TObj typed views** — JObj is enough for csx Pass
-  0–4.  Other accessors land in `hsdraw_core` first (already there for
-  read-only walk) and get expose to Python when an actual writer use
-  case shows up.
-- **POBJ writer** (Blender mesh → fresh display list) — see
-  `docs/roadmap.md`.
+- **Paletted-format encoders** — CI4 / CI8 / CI14X2 / I4 / I8 / IA4 /
+  IA8 are read-only.  The vanilla MKGP2 corpus has zero hits across
+  7,812 textures, so the addon can route paletted sources through
+  RGB5A3 / RGB565 instead.  Adding palette quantization is mechanical
+  when a use case lands.
 
 ## Identity contract
 

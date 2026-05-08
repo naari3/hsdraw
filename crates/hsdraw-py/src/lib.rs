@@ -1675,6 +1675,30 @@ fn export_scene_json(
         .map_err(|e| PyIOError::new_err(format!("serialize scene: {}", e)))
 }
 
+/// Encode RGBA8 source bytes into a GX texture format payload.
+/// Wraps `hsdraw_core::gx_image::encode_image`: pass `format` as the
+/// `GxTexFmt` integer (4=RGB565, 5=RGB5A3, 6=RGBA8, 14=CMP) and the
+/// raw RGBA8 source as `bytes` of exactly `4 * width * height` bytes.
+/// Output dimensions get padded to the format's natural tile boundary
+/// (4 or 8), so the byte count matches what `decode_image` consumes.
+/// Other formats (I4/I8/IA4/IA8/CIxx) raise `ValueError`.  Useful for
+/// pipelines that already have an RGBA8 source — image_data into
+/// `Image.set_image_data_bytes(gx_encode(...))`.
+#[pyfunction]
+#[pyo3(signature = (format, width, height, rgba, /))]
+fn gx_encode<'py>(
+    py: Python<'py>,
+    format: u32,
+    width: u32,
+    height: u32,
+    rgba: &Bound<'_, PyBytes>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let fmt = GxTexFmt::from(format);
+    let out = hsdraw_core::gx_image::encode_image(fmt, width, height, rgba.as_bytes())
+        .map_err(|e| PyValueError::new_err(format!("gx_encode: {:?}", e)))?;
+    Ok(PyBytes::new(py, &out))
+}
+
 /// Round-trip parse + write.  Standalone form of `Dat.write()` for
 /// callers that just want bytes-in, bytes-out without holding a `Dat`.
 #[pyfunction]
@@ -1762,6 +1786,7 @@ fn hsdraw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_dat, m)?)?;
     m.add_function(wrap_pyfunction!(export_scene_json, m)?)?;
     m.add_function(wrap_pyfunction!(write_dat, m)?)?;
+    m.add_function(wrap_pyfunction!(gx_encode, m)?)?;
     m.add_class::<PyDat>()?;
     m.add_class::<PyRoot>()?;
     m.add_class::<PyHsdStruct>()?;

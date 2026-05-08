@@ -57,12 +57,29 @@ the upstream of csx in this regard.
   current writer puts everything in one POBJ regardless.  Useful for
   fighter data where one logical mesh spans many bone groups.
 
-## Texture re-pack from PNG
+## Texture re-pack — paletted formats
 
-Same shape — invert `gx_image::decode_image` for each format.  CMP and
-RGB5A3 are the awkward ones (they involve perceptual tuning); the
-others are mechanical.  Useful when the add-on edits a UV-mapped image
-in Blender and wants to feed it back.
+RGBA8 / RGB565 / RGB5A3 / CMP encoders ship in `gx_image::encode_image`
+(CMP via `texpresso` BC1 + GX-specific BE word swap + 8x8 super-block
+swizzle).  Plus the TObj / Image allocators in `common.rs` and the
+`Dat::alloc_scene_data` factory let an addon produce a self-contained
+.dat with no base file — see `tests/from_scratch.rs` for the
+end-to-end verification path.
+
+What's still deferred:
+
+- **Paletted formats (CI4 / CI8 / CI14X2)** — vanilla MKGP2 corpus has
+  zero hits across 7,812 textures so the addon routes paletted sources
+  through RGB5A3 / RGB565 instead.  Adding palette quantization (median-
+  cut + nearest-color index assignment) plus a Tlut allocator is
+  mechanical when a use case lands.
+- **Intensity formats (I4 / I8 / IA4 / IA8)** — same story.  These are
+  pure 8-bit-channel quantize-then-pack inverse operations once a
+  consumer wants them.
+- **PNG ↔ raw byte path** — Image.image_data() returns raw bytes, but
+  there's no `decode_to_png` / `encode_from_png` convenience yet; the
+  addon does the PNG codec step itself via `Pillow` since it already
+  has UV-mapping and Blender-side processing in Python.
 
 ## Higher-platform wheel matrix
 

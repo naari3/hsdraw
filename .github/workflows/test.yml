@@ -76,3 +76,13 @@ jobs:
           echo "Installing $wheel"
           pip install "$wheel"
           python -c "import hsdraw; print('version:', hsdraw.version()); assert callable(hsdraw.parse_dat); assert callable(hsdraw.write_dat); assert callable(hsdraw.export_scene_json)"
+
+      - name: from-scratch chain smoke
+        shell: bash
+        working-directory: crates/hsdraw-py
+        # Exercises the full Dat.alloc_scene_data → JObj → DObj → MObj →
+        # Material → TObj → Image → 4x4 RGBA8 (gx_encode → RGB565) chain
+        # at the PyO3 layer.  Mirrors tests/from_scratch.rs in the core
+        # crate so any divergence between the Rust and Python surfaces
+        # surfaces here.
+        run: python tests/smoke_from_scratch.py

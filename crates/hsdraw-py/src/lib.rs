@@ -25,8 +25,8 @@ use hsdraw_core::common::{
 };
 use hsdraw_core::dat::RootNode;
 use hsdraw_core::gx::{
-    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexMapId, GxWrapMode, JObjFlag,
-    MaterialRenderMode, TObjFlags,
+    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexMapId, GxTlutFmt, GxWrapMode,
+    JObjFlag, MaterialRenderMode, TObjFlags,
 };
 use hsdraw_core::hsd_struct::{StructRef, ptr_eq};
 use hsdraw_core::pobj_writer::MeshBuilder as CoreMeshBuilder;
@@ -1699,6 +1699,54 @@ fn gx_encode<'py>(
     Ok(PyBytes::new(py, &out))
 }
 
+/// Decode a GX texture format payload back to RGBA8.
+///
+/// Wraps `hsdraw_core::gx_image::decode_image`: pass `format` as the
+/// `GxTexFmt` integer (0=I4, 1=I8, 2=IA4, 3=IA8, 4=RGB565, 5=RGB5A3,
+/// 6=RGBA8, 8=CI4, 9=CI8, 10=CI14X2, 14=CMP) and the raw GX-encoded
+/// bytes via `gx_bytes` (length must be at least the format's
+/// `image_size(w, h)`).  Output is exactly `4 * width * height` bytes
+/// of RGBA8, byte order R, G, B, A — the Rust core already mirrors
+/// HSDLib's BGRA→RGBA swap internally for RGBA8 / CMP, so callers
+/// don't need to swap channels themselves (csx scripts on top of
+/// HSDLib do, because HSDLib's `GetDecodedImageData()` returns BGRA).
+///
+/// Paletted formats (CI4 / CI8 / CI14X2) require the TLUT payload via
+/// `palette` plus `palette_format` (the `GxTlutFmt` integer: 0=IA8,
+/// 1=RGB565, 2=RGB5A3 — defaults to RGB5A3, the most common course-
+/// data choice).  Non-paletted formats ignore both palette args.
+///
+/// Useful for pipelines that need to surface a TObj's
+/// `Image.image_data()` to Blender / Pillow / etc. without going
+/// through the csx + ImageSharp + dotnet-script chain.
+#[pyfunction]
+#[pyo3(signature = (format, width, height, gx_bytes, palette = None, palette_format = 2, /))]
+fn gx_decode<'py>(
+    py: Python<'py>,
+    format: u32,
+    width: u32,
+    height: u32,
+    gx_bytes: &Bound<'_, PyBytes>,
+    palette: Option<&Bound<'_, PyBytes>>,
+    palette_format: u32,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let fmt = GxTexFmt::from(format);
+    let pal_fmt = GxTlutFmt::from(palette_format);
+    // Stash the palette borrow before constructing the tuple so the
+    // borrow's lifetime out-lives the `pal_arg` we hand to decode_image.
+    let pal_bytes = palette.map(|b| b.as_bytes());
+    let pal_arg = pal_bytes.map(|data| (pal_fmt, data));
+    let out = hsdraw_core::gx_image::decode_image(
+        fmt,
+        width,
+        height,
+        gx_bytes.as_bytes(),
+        pal_arg,
+    )
+    .map_err(|e| PyValueError::new_err(format!("gx_decode: {:?}", e)))?;
+    Ok(PyBytes::new(py, &out))
+}
+
 /// Round-trip parse + write.  Standalone form of `Dat.write()` for
 /// callers that just want bytes-in, bytes-out without holding a `Dat`.
 #[pyfunction]
@@ -1787,6 +1835,7 @@ fn hsdraw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(export_scene_json, m)?)?;
     m.add_function(wrap_pyfunction!(write_dat, m)?)?;
     m.add_function(wrap_pyfunction!(gx_encode, m)?)?;
+    m.add_function(wrap_pyfunction!(gx_decode, m)?)?;
     m.add_class::<PyDat>()?;
     m.add_class::<PyRoot>()?;
     m.add_class::<PyHsdStruct>()?;

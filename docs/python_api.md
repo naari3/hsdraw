@@ -62,6 +62,7 @@ straight into Python without bringing project-specific schemas (e.g.
 | `Image.alloc()` + `.set_image_data_bytes(b)` | `new HSD_Image { ImageData = HSDStruct(b) }`         | image alloc + payload |
 | `Image.{width,height,format,mipmap,min_lod,max_lod}` | `img.Width` / `.Height` / `.Format` / `.MipMap` / `.LODBias` / `.MaxLOD` | per-field setters |
 | `hsdraw.gx_encode(format, w, h, rgba) -> bytes` | `GXImageConverter.EncodeImage(GX_TF_*, w, h, rgba)` | RGBA8 → GX bytes encoder (RGBA8 / RGB565 / RGB5A3 / CMP only) |
+| `hsdraw.gx_decode(format, w, h, gx_bytes, palette=None, palette_format=2) -> bytes` | `GXImageConverter.DecodeImage(GX_TF_*, w, h, raw, tlutFmt, tlutData)` | GX bytes → RGBA8 decoder (all formats, RGBA-ordered output, BGRA swap done in core) |
 | `HsdStruct.byte_size()` / `.raw()`      | `_s.Length` / `_s.GetData()`                              | introspection       |
 | `HsdStruct.references() -> [(off, target)]` | `_s.References`                                       | walk raw refs       |
 | `HsdStruct.get_reference(offset)`       | `_s.GetReference<HSDAccessor>(offset)` (sans typed cast)  | offset lookup       |
@@ -84,6 +85,14 @@ straight into Python without bringing project-specific schemas (e.g.
   (4=RGB565, 5=RGB5A3, 6=RGBA8, 14=CMP); other values raise
   `ValueError`.  Output is padded to the format's natural tile
   boundary; feed it into `Image.set_image_data_bytes(...)`.
+- `hsdraw.gx_decode(format, width, height, gx_bytes, palette=None,
+  palette_format=2) -> bytes` — inverse of `gx_encode`, plus support
+  for I4 / I8 / IA4 / IA8 / CIxx (palette mandatory for CIxx;
+  `palette_format` is the `GxTlutFmt` integer, defaults to 2 = RGB5A3).
+  Output is `4 * width * height` bytes RGBA8 — the Rust core mirrors
+  HSDLib's BGRA→RGBA swap internally for RGBA8 / CMP, so callers
+  don't need a manual swap (csx scripts on top of HSDLib do, since
+  `t.GetDecodedImageData()` returns BGRA).
 
 ### Mutation primitives
 

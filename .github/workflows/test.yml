@@ -86,3 +86,12 @@ jobs:
         # crate so any divergence between the Rust and Python surfaces
         # surfaces here.
         run: python tests/smoke_from_scratch.py
+
+      - name: gx_decode round-trip smoke
+        shell: bash
+        working-directory: crates/hsdraw-py
+        # Encode → decode round-trip for RGBA8 / RGB565 / RGB5A3 / CMP
+        # plus error-path coverage (truncated payload, palette ignored
+        # on non-paletted formats).  Pins the gx_decode wrapper that
+        # the mkgp2-patch addon's csx-free import path depends on.
+        run: python tests/smoke_gx_decode.py

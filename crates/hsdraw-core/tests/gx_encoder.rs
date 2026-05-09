@@ -17,7 +17,9 @@
 //! all-color blocks satisfy in practice.
 
 use hsdraw_core::gx::GxTexFmt;
-use hsdraw_core::gx_image::{decode_image, encode_image, image_size};
+use hsdraw_core::gx_image::{
+    decode_image, encode_image, encode_image_with_options, image_size, EncodeOptions,
+};
 
 /// Build a 4x4 RGBA8 pattern with deterministic per-pixel values.
 fn pattern_4x4() -> Vec<u8> {
@@ -261,6 +263,84 @@ fn cmp_super_block_swizzle_addresses_correctly_for_16x16() {
             );
         }
     }
+}
+
+#[test]
+fn rgb5a3_swap_rb_option_is_inverse_of_post_decode_swap() {
+    // With swap_rb_for_rgb5a3 enabled, the encoder pre-swaps R↔B in
+    // the source.  Decoding the result with the un-swapped decoder
+    // gives BGRA-ordered output relative to the input — so post-
+    // swapping R↔B in the decoded buffer must recover the same RGBA
+    // values the un-swapped encoder→decoder pair produces (i.e. the
+    // 5/5/5-snapped originals from `rgb5a3_uses_rgb555_for_opaque_pixels`).
+    let src = pattern_4x4();
+    let opts = EncodeOptions { swap_rb_for_rgb5a3: true };
+    let enc_swap = encode_image_with_options(GxTexFmt::RGB5A3, 4, 4, &src, opts).unwrap();
+    let dec_swap = decode_image(GxTexFmt::RGB5A3, 4, 4, &enc_swap, None).unwrap();
+
+    // Post-swap R↔B in the decoded buffer.
+    let mut unswapped = dec_swap.clone();
+    for px in unswapped.chunks_mut(4) {
+        px.swap(0, 2);
+    }
+
+    // Un-swapped encode → decode of the same source.
+    let enc_plain = encode_image(GxTexFmt::RGB5A3, 4, 4, &src).unwrap();
+    let dec_plain = decode_image(GxTexFmt::RGB5A3, 4, 4, &enc_plain, None).unwrap();
+
+    assert_eq!(
+        unswapped, dec_plain,
+        "swap_rb_for_rgb5a3 + post-decode R↔B swap must recover the un-swapped pipeline output"
+    );
+}
+
+#[test]
+fn encode_with_options_default_matches_plain_encode() {
+    // The thin wrapper [`encode_image`] = [`encode_image_with_options`]
+    // with `EncodeOptions::default()`.  Pin that contract.
+    let src = pattern_4x4();
+    for fmt in [
+        GxTexFmt::RGBA8,
+        GxTexFmt::RGB565,
+        GxTexFmt::RGB5A3,
+    ] {
+        let plain = encode_image(fmt, 4, 4, &src).unwrap();
+        let with_opts = encode_image_with_options(
+            fmt,
+            4,
+            4,
+            &src,
+            EncodeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(plain, with_opts, "{:?} default options divergence", fmt);
+    }
+}
+
+#[test]
+fn swap_rb_option_is_a_noop_for_non_rgb5a3() {
+    // Only RGB5A3 reads the swap_rb flag.  Opt-in must not perturb
+    // RGBA8 / RGB565 / CMP outputs.
+    let src = pattern_4x4();
+    let opts = EncodeOptions { swap_rb_for_rgb5a3: true };
+    for fmt in [GxTexFmt::RGBA8, GxTexFmt::RGB565] {
+        let plain = encode_image(fmt, 4, 4, &src).unwrap();
+        let with_swap = encode_image_with_options(fmt, 4, 4, &src, opts).unwrap();
+        assert_eq!(
+            plain, with_swap,
+            "{:?} encoder must ignore swap_rb_for_rgb5a3",
+            fmt
+        );
+    }
+
+    // CMP: source needs to be 8x8 to match the format's tile bound.
+    let mut cmp_src = Vec::with_capacity(8 * 8 * 4);
+    for i in 0..64u8 {
+        cmp_src.extend_from_slice(&[i.wrapping_mul(3), i, i.wrapping_mul(7), 0xFF]);
+    }
+    let plain = encode_image(GxTexFmt::CMP, 8, 8, &cmp_src).unwrap();
+    let with_swap = encode_image_with_options(GxTexFmt::CMP, 8, 8, &cmp_src, opts).unwrap();
+    assert_eq!(plain, with_swap, "CMP encoder must ignore swap_rb_for_rgb5a3");
 }
 
 #[test]

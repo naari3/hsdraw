@@ -81,9 +81,22 @@ impl PObjFlag {
     pub const SHAPEANIM: Self = Self(1 << 12);
     pub const ENVELOPE: Self = Self(2 << 12);
     pub const SHAPESET: Self = Self(1 << 9);
-    /// HSDLib calls this `CULLBACK` (= `1 << 14`).
+    /// HSDLib calls this `CULLBACK` (= `1 << 14`), but the bit lands
+    /// inside `POBJ_TYPE_MASK` (0xE000) without matching any valid
+    /// POBJ type, so renderers dispatching on the type nibble treat
+    /// it as an unknown POBJ.  Cull mode belongs on `PeDesc`, not
+    /// POBJ.flags — kept here for read-side compatibility with legacy
+    /// .dat files only.
+    #[deprecated(
+        note = "POBJ.flags 0x4000 trap — cull mode belongs on PeDesc, not POBJ.flags."
+    )]
     pub const CULLBACK: Self = Self(1 << 14);
-    /// HSDLib calls this `CULLFRONT` (= `1 << 15`).
+    /// HSDLib calls this `CULLFRONT` (= `1 << 15`).  Same trap as
+    /// `CULLBACK` — collides with `POBJ_FLAG.ENVELOPE` in HSDLib's
+    /// enum encoding.  Use `PeDesc` for cull mode.
+    #[deprecated(
+        note = "POBJ.flags 0x8000 trap — collides with POBJ_FLAG.ENVELOPE."
+    )]
     pub const CULLFRONT: Self = Self(1 << 15);
 
     pub fn from_bits_retain(bits: u16) -> Self {
@@ -323,6 +336,30 @@ plain_enum!(GxPrimitiveType, u8, {
     Lines = 0xA8,
     LineStrip = 0xB0,
     Points = 0xB8,
+});
+
+plain_enum!(GxTexGenSrc, u32, {
+    GX_TG_POS = 0,
+    GX_TG_NRM = 1,
+    GX_TG_BINRM = 2,
+    GX_TG_TANGENT = 3,
+    GX_TG_TEX0 = 4,
+    GX_TG_TEX1 = 5,
+    GX_TG_TEX2 = 6,
+    GX_TG_TEX3 = 7,
+    GX_TG_TEX4 = 8,
+    GX_TG_TEX5 = 9,
+    GX_TG_TEX6 = 10,
+    GX_TG_TEX7 = 11,
+    GX_TG_TEXCOORD0 = 12,
+    GX_TG_TEXCOORD1 = 13,
+    GX_TG_TEXCOORD2 = 14,
+    GX_TG_TEXCOORD3 = 15,
+    GX_TG_TEXCOORD4 = 16,
+    GX_TG_TEXCOORD5 = 17,
+    GX_TG_TEXCOORD6 = 18,
+    GX_TG_COLOR0 = 19,
+    GX_TG_COLOR1 = 20,
 });
 
 plain_enum!(GxAttribName, u32, {

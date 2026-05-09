@@ -5,7 +5,10 @@
 
 use crate::accessor::{Accessor, accessor};
 use crate::error::Result;
-use crate::gx::{GxTexFmt, GxTexMapId, GxTexFilter, GxWrapMode, JObjFlag, MaterialRenderMode, PObjFlag, TObjFlags, AlphaMap, ColorMap, CoordType, GxTlutFmt};
+use crate::gx::{
+    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexGenSrc, GxTexMapId, GxTlutFmt,
+    GxWrapMode, JObjFlag, MaterialRenderMode, PObjFlag, TObjFlags,
+};
 use crate::hsd_struct::{HsdStruct, StructRef};
 
 // =====================================================================
@@ -408,6 +411,15 @@ impl TObj {
     pub fn tex_map_id(&self) -> Result<GxTexMapId> {
         Ok(GxTexMapId::from(self.s().get_u32(0x08)?))
     }
+    /// `GXTexGenSrc` at offset 0x0C (HSDLib `HSD_TOBJ.GXTexGenSrc`).
+    /// Selects which vertex source feeds the texture-coord generator:
+    /// `GX_TG_TEX0` (4) takes UVs from the POBJ's TEX0 attribute,
+    /// `GX_TG_POS` (0) generates them from world position, etc.  The
+    /// freshly-allocated default is 0 (`GX_TG_POS`); regular UV-mapped
+    /// textures want `GX_TG_TEX0` set explicitly via `set_tex_gen_src`.
+    pub fn tex_gen_src(&self) -> Result<GxTexGenSrc> {
+        Ok(GxTexGenSrc::from(self.s().get_u32(0x0C)?))
+    }
     pub fn rx(&self) -> Result<f32> { self.s().get_f32(0x10) }
     pub fn ry(&self) -> Result<f32> { self.s().get_f32(0x14) }
     pub fn rz(&self) -> Result<f32> { self.s().get_f32(0x18) }
@@ -464,6 +476,16 @@ impl TObj {
         self.0.borrow_mut().set_u32(0x08, u32::from(id))
     }
 
+    /// Set the `GXTexGenSrc` (offset 0x0C).  HSDLib equivalent:
+    /// `tobj.GXTexGenSrc = GX_TG_TEX0`.  Default after
+    /// `allocate_default` is `GX_TG_POS` (=0) — the all-zero-bytes
+    /// initial state — so callers building a fresh TObj for a
+    /// UV-mapped texture should set this to `GX_TG_TEX0` explicitly.
+    pub fn set_tex_gen_src(&self, src: GxTexGenSrc) -> Result<()> {
+        self.ensure_tobj_size();
+        self.0.borrow_mut().set_u32(0x0C, u32::from(src))
+    }
+
     /// Set rotation triple at (0x10, 0x14, 0x18).
     pub fn set_rotation(&self, rx: f32, ry: f32, rz: f32) -> Result<()> {
         self.ensure_tobj_size();
@@ -518,10 +540,84 @@ impl TObj {
     /// `alpha_operation` (bits 20-23) into the same word; if you want
     /// to set those without clobbering the base flags use
     /// `set_coord_type` / `set_color_operation` / `set_alpha_operation`,
-    /// which read-modify-write the relevant nibble in place.
+    /// which read-modify-write the relevant nibble in place.  For
+    /// individual `TObjFlags` bits use the named `set_lightmap_*` /
+    /// `set_bump` setters below — they RMW just one bit and preserve
+    /// the nibbles + every other flag.
     pub fn set_flags(&self, flags: TObjFlags) -> Result<()> {
         self.ensure_tobj_size();
         self.0.borrow_mut().set_u32(0x40, flags.bits())
+    }
+
+    /// RMW a single `TObjFlags` bit at offset 0x40, preserving every
+    /// other bit (including the coord_type / color_op / alpha_op
+    /// nibbles).  Foundation for the named `set_lightmap_*` /
+    /// `set_bump` setters; exposed in case callers want to toggle a
+    /// custom mask.
+    pub fn set_flag_bit(&self, mask: TObjFlags, on: bool) -> Result<()> {
+        self.ensure_tobj_size();
+        let mut s = self.0.borrow_mut();
+        let old = s.get_u32(0x40)?;
+        let new = if on {
+            old | mask.bits()
+        } else {
+            old & !mask.bits()
+        };
+        s.set_u32(0x40, new)
+    }
+
+    /// `LIGHTMAP_DIFFUSE` (bit 4).  HSDLib's `LIGHTMAP_DIFFUSE` flag —
+    /// signals that this texture participates in the diffuse lighting
+    /// stage.  Some shipped renderers skip texture sampling entirely
+    /// for TObjs without this bit, even when render-flags / TEX0 /
+    /// TObj-ref are wired up correctly, so it's worth setting on
+    /// freshly-allocated TObjs unless you specifically don't want the
+    /// texture to influence the diffuse channel.
+    pub fn set_lightmap_diffuse(&self, on: bool) -> Result<()> {
+        self.set_flag_bit(TObjFlags::LIGHTMAP_DIFFUSE, on)
+    }
+    pub fn is_lightmap_diffuse(&self) -> Result<bool> {
+        Ok(self.flags()?.intersects(TObjFlags::LIGHTMAP_DIFFUSE))
+    }
+
+    /// `LIGHTMAP_SPECULAR` (bit 5).
+    pub fn set_lightmap_specular(&self, on: bool) -> Result<()> {
+        self.set_flag_bit(TObjFlags::LIGHTMAP_SPECULAR, on)
+    }
+    pub fn is_lightmap_specular(&self) -> Result<bool> {
+        Ok(self.flags()?.intersects(TObjFlags::LIGHTMAP_SPECULAR))
+    }
+
+    /// `LIGHTMAP_AMBIENT` (bit 6).
+    pub fn set_lightmap_ambient(&self, on: bool) -> Result<()> {
+        self.set_flag_bit(TObjFlags::LIGHTMAP_AMBIENT, on)
+    }
+    pub fn is_lightmap_ambient(&self) -> Result<bool> {
+        Ok(self.flags()?.intersects(TObjFlags::LIGHTMAP_AMBIENT))
+    }
+
+    /// `LIGHTMAP_EXT` (bit 7).
+    pub fn set_lightmap_ext(&self, on: bool) -> Result<()> {
+        self.set_flag_bit(TObjFlags::LIGHTMAP_EXT, on)
+    }
+    pub fn is_lightmap_ext(&self) -> Result<bool> {
+        Ok(self.flags()?.intersects(TObjFlags::LIGHTMAP_EXT))
+    }
+
+    /// `LIGHTMAP_SHADOW` (bit 8).
+    pub fn set_lightmap_shadow(&self, on: bool) -> Result<()> {
+        self.set_flag_bit(TObjFlags::LIGHTMAP_SHADOW, on)
+    }
+    pub fn is_lightmap_shadow(&self) -> Result<bool> {
+        Ok(self.flags()?.intersects(TObjFlags::LIGHTMAP_SHADOW))
+    }
+
+    /// `BUMP` (bit 24).
+    pub fn set_bump(&self, on: bool) -> Result<()> {
+        self.set_flag_bit(TObjFlags::BUMP, on)
+    }
+    pub fn is_bump(&self) -> Result<bool> {
+        Ok(self.flags()?.intersects(TObjFlags::BUMP))
     }
 
     /// Replace the low 4 bits of the 0x40 word with `coord` (the GX

@@ -1,11 +1,6 @@
-//! Round-trip tests for MObj / Material / PeDesc allocation primitives.
-//!
-//! These mirror the same parse → mutate → write → re-parse loop that
-//! the POBJ writer tests use, but exercise the material side of the
-//! `D{Obj} → M{Obj} → Material/PeDesc/Texture` chain.  Phase 1 doesn't
-//! ship a TObj writer (texture re-pack is roadmapped); the tests here
-//! cover the unlit / vertex-colored / placeholder material paths
-//! mkgp2-patch's addon needs to attach POBJs to.
+//! Round-trip tests for MObj / Material / PeDesc / TObj / Image
+//! allocation primitives.  Each test drives parse → mutate → write →
+//! re-parse and asserts the expected delta on the rebuilt tree.
 
 use hsdraw_core::accessor::Accessor;
 use hsdraw_core::common::{
@@ -13,7 +8,7 @@ use hsdraw_core::common::{
 };
 use hsdraw_core::dat::{Dat, RootNode};
 use hsdraw_core::gx::{
-    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexMapId, GxWrapMode,
+    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexGenSrc, GxTexMapId, GxWrapMode,
     MaterialRenderMode, TObjFlags,
 };
 use hsdraw_core::hsd_struct::HsdStruct;
@@ -233,6 +228,82 @@ fn tobj_image_chain_round_trips() {
     assert_eq!(img2.format().unwrap(), GxTexFmt::RGB565);
     let bytes = img2.image_data().expect("raw bytes survived");
     assert_eq!(bytes, payload);
+}
+
+#[test]
+fn tobj_tex_gen_src_round_trips() {
+    // GXTexGenSrc lives at offset 0x0C — verify it round-trips through
+    // the writer + re-parse and isn't clobbered by any other setter.
+    let mobj = MObj::allocate_default();
+    let tobj = TObj::allocate_default();
+    tobj.set_tex_map_id(GxTexMapId::GX_TEXMAP0).unwrap();
+    tobj.set_scale(1.0, 1.0, 1.0).unwrap();
+    tobj.set_tex_gen_src(GxTexGenSrc::GX_TG_TEX0).unwrap();
+    let img = Image::allocate_default();
+    img.set_width(4).unwrap();
+    img.set_height(4).unwrap();
+    img.set_format(GxTexFmt::RGB565).unwrap();
+    img.set_image_data_bytes(vec![0u8; 32]);
+    tobj.set_image_data(Some(img));
+    mobj.set_textures(Some(tobj));
+
+    let dat = round_trip(dat_with_mobj(mobj));
+    let tobj2 = extract_first_mobj(&dat).textures().unwrap();
+    assert_eq!(tobj2.tex_gen_src().unwrap(), GxTexGenSrc::GX_TG_TEX0);
+}
+
+#[test]
+fn tobj_named_lightmap_setters_preserve_other_bits() {
+    // RMW guarantee: set_lightmap_diffuse(true) must leave the
+    // coord_type / color_op / alpha_op nibbles + every other flag bit
+    // alone.  We seed those nibbles + an extra flag (BUMP), then flip
+    // LIGHTMAP_DIFFUSE on and verify nothing else changed.
+    let tobj = TObj::allocate_default();
+    tobj.set_coord_type(CoordType::REFLECTION).unwrap();
+    tobj.set_color_operation(ColorMap::BLEND).unwrap();
+    tobj.set_alpha_operation(AlphaMap::MODULATE).unwrap();
+    tobj.set_bump(true).unwrap();
+    let snap_before = tobj.0.borrow().get_u32(0x40).unwrap();
+
+    tobj.set_lightmap_diffuse(true).unwrap();
+    let after = tobj.0.borrow().get_u32(0x40).unwrap();
+    assert_eq!(
+        after,
+        snap_before | (1u32 << 4),
+        "set_lightmap_diffuse must add exactly bit 4"
+    );
+    assert!(tobj.is_lightmap_diffuse().unwrap());
+    assert_eq!(tobj.coord_type().unwrap(), CoordType::REFLECTION);
+    assert_eq!(tobj.color_operation().unwrap(), ColorMap::BLEND);
+    assert_eq!(tobj.alpha_operation().unwrap(), AlphaMap::MODULATE);
+    assert!(tobj.is_bump().unwrap());
+
+    // Toggle off → returns to the seeded state.
+    tobj.set_lightmap_diffuse(false).unwrap();
+    assert_eq!(tobj.0.borrow().get_u32(0x40).unwrap(), snap_before);
+    assert!(!tobj.is_lightmap_diffuse().unwrap());
+
+    // All five lightmap setters + BUMP work the same way.  Each
+    // iteration: toggle to the opposite of current, then toggle back,
+    // assert we're at the original state.  Robust to whether the bit
+    // is on or off in the seeded `tobj` already.
+    for f in [
+        TObjFlags::LIGHTMAP_DIFFUSE,
+        TObjFlags::LIGHTMAP_SPECULAR,
+        TObjFlags::LIGHTMAP_AMBIENT,
+        TObjFlags::LIGHTMAP_EXT,
+        TObjFlags::LIGHTMAP_SHADOW,
+        TObjFlags::BUMP,
+    ] {
+        let before = tobj.0.borrow().get_u32(0x40).unwrap();
+        let was_set = (before & f.bits()) != 0;
+        tobj.set_flag_bit(f, !was_set).unwrap();
+        let after = tobj.0.borrow().get_u32(0x40).unwrap();
+        assert_eq!((after & f.bits()) != 0, !was_set, "toggle to opposite");
+        assert_eq!(after & !f.bits(), before & !f.bits(), "other bits intact");
+        tobj.set_flag_bit(f, was_set).unwrap();
+        assert_eq!(tobj.0.borrow().get_u32(0x40).unwrap(), before, "restore");
+    }
 }
 
 #[test]

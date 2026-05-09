@@ -629,3 +629,36 @@ fn envelope_with_triangle_strips() {
         assert_eq!(vert.pn_mtx_idx, 0);
     }
 }
+
+#[test]
+fn deprecated_set_cull_back_does_not_write_pobj_flags() {
+    // Pin the #9 deprecation: set_cull_back / set_cull_front are now
+    // no-ops at the POBJ.flags level — the historical 0x4000 / 0x8000
+    // bits collide with POBJ_TYPE_MASK and POBJ_FLAG.ENVELOPE.  After
+    // calling both setters and building, the POBJ.flags word must NOT
+    // carry either bit.
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.0, 0.0);
+    mb.add_position(0.0, 1.0, 0.0);
+    mb.add_triangle(0, 1, 2);
+    #[allow(deprecated)]
+    {
+        mb.set_cull_back(true);
+        mb.set_cull_front(true);
+    }
+    let pobj = mb.build().expect("build");
+    let bits = pobj.flags().expect("flags").bits();
+    assert_eq!(
+        bits & 0x4000,
+        0,
+        "set_cull_back must not set POBJ.flags bit 0x4000 (got 0x{:04X})",
+        bits
+    );
+    assert_eq!(
+        bits & 0x8000,
+        0,
+        "set_cull_front must not set POBJ.flags bit 0x8000 (got 0x{:04X})",
+        bits
+    );
+}

@@ -496,11 +496,26 @@ pub fn palette_to_rgba(format: GxTlutFmt, data: &[u8]) -> Vec<u8> {
 // =====================================================================
 // GX texture encoders.  Inverse of the per-format decoders above.
 // Tlut / paletted formats (CI4 / CI8 / CI14X2) are intentionally NOT
-// encoded — vanilla MKGP2 corpus shows zero hits across 7,812 textures
-// in 1,918 .dat files, so the addon can route those to RGB5A3 / RGB565
-// instead.  Adding palette quantization is mechanical when a use case
-// arrives.
+// encoded — the test corpus we calibrated against shows zero hits for
+// those across thousands of textures, and adding palette quantization
+// (median-cut + nearest-color) is mechanical when a use case arrives.
+// Callers that need a paletted source can route through RGB5A3 /
+// RGB565 instead.
 // =====================================================================
+
+/// Per-format encode tweaks.  Default state (`EncodeOptions::default()`)
+/// matches the un-tweaked HSDLib-equivalent inverse of `decode_image`;
+/// individual flags are opt-ins for callers whose target renderer
+/// deviates from HSDLib's reference channel/bit interpretation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EncodeOptions {
+    /// Pre-swap R↔B in the source RGBA before the RGB5A3 encode loop.
+    /// Use when the target renderer's RGB5A3 sampler reads channels in
+    /// BGR order — observed on at least one shipped GameCube / Triforce
+    /// title where the runtime sampler swaps the 5/5/5 fields relative
+    /// to HSDLib's reference order.  No effect on RGBA8 / RGB565 / CMP.
+    pub swap_rb_for_rgb5a3: bool,
+}
 
 /// Encode `rgba` (length = `4 * width * height`) into the GX-format
 /// byte stream `format` expects.  RGBA8 / RGB565 / RGB5A3 / CMP only;
@@ -510,13 +525,28 @@ pub fn palette_to_rgba(format: GxTlutFmt, data: &[u8]) -> Vec<u8> {
 /// corresponding decoder reads.  CMP uses `texpresso`'s BC1 cluster-fit
 /// encoder (perceptual weights, no alpha-weighted clustering — matches
 /// HSDLib's "alpha-aware mode-0 fallback" except we always emit mode-1
-/// 4-color blocks since vanilla MKGP2 CMP textures don't carry punch-
-/// through alpha).
+/// 4-color blocks; punch-through alpha isn't covered by the BC1 path
+/// (use RGB5A3 if the source has 1-bit transparent pixels).  Thin
+/// wrapper over [`encode_image_with_options`] with
+/// `EncodeOptions::default()`.
 pub fn encode_image(
     format: GxTexFmt,
     width: u32,
     height: u32,
     rgba: &[u8],
+) -> Result<Vec<u8>> {
+    encode_image_with_options(format, width, height, rgba, EncodeOptions::default())
+}
+
+/// Same as [`encode_image`] but takes [`EncodeOptions`] for renderer-
+/// specific channel-order tweaks (e.g. `swap_rb_for_rgb5a3` for
+/// renderers with a BGR-order RGB5A3 sampler).
+pub fn encode_image_with_options(
+    format: GxTexFmt,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    options: EncodeOptions,
 ) -> Result<Vec<u8>> {
     if rgba.len() != (width as usize) * (height as usize) * 4 {
         return Err(HsdError::malformed(
@@ -527,7 +557,17 @@ pub fn encode_image(
     Ok(match format {
         GxTexFmt::RGBA8 => to_rgba8(rgba, width, height),
         GxTexFmt::RGB565 => to_rgb565(rgba, width, height),
-        GxTexFmt::RGB5A3 => to_rgb5a3(rgba, width, height),
+        GxTexFmt::RGB5A3 => {
+            if options.swap_rb_for_rgb5a3 {
+                let mut swapped = rgba.to_vec();
+                for px in swapped.chunks_mut(4) {
+                    px.swap(0, 2);
+                }
+                to_rgb5a3(&swapped, width, height)
+            } else {
+                to_rgb5a3(rgba, width, height)
+            }
+        }
         GxTexFmt::CMP => to_cmp(rgba, width, height),
         GxTexFmt::I4
         | GxTexFmt::I8

@@ -112,8 +112,9 @@ impl Dat {
 
     // ------------------------------------------------------------------
     // From-scratch synthesis factory.  Useful when a caller wants to
-    // produce a fresh .dat without reading an existing one — e.g. the
-    // mkgp2-patch Blender pipeline's vanilla-independent export path.
+    // produce a fresh .dat without reading an existing one — e.g. an
+    // exporter that builds the structure entirely from CPU-side data
+    // with no base file to start from.
     // ------------------------------------------------------------------
 
     /// Allocate an empty `Dat` with a `scene_data` root holding a fresh

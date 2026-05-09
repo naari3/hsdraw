@@ -201,7 +201,12 @@ impl HsdStruct {
     // file silently.
     // ------------------------------------------------------------------
 
-    fn put_bytes(&mut self, offset: u32, src: &[u8]) -> Result<()> {
+    /// Bulk byte write at `offset`.  Out-of-bounds writes return an
+    /// error.  Public counterpart to [`Self::get_bytes`] for callers
+    /// that need to patch raw struct payloads directly (e.g. addons
+    /// that hit a missing typed-setter and would otherwise resort to
+    /// post-write file-byte find/replace).
+    pub fn set_bytes(&mut self, offset: u32, src: &[u8]) -> Result<()> {
         let start = offset as usize;
         let end = start
             .checked_add(src.len())
@@ -221,24 +226,30 @@ impl HsdStruct {
         Ok(())
     }
 
+    /// Single-byte write.  Errors out-of-bounds (vs panicking on a
+    /// `data_mut()[off] = v` pattern).
+    pub fn set_u8(&mut self, offset: u32, value: u8) -> Result<()> {
+        self.set_bytes(offset, &[value])
+    }
+
     pub fn set_u16(&mut self, offset: u32, value: u16) -> Result<()> {
-        self.put_bytes(offset, &value.to_be_bytes())
+        self.set_bytes(offset, &value.to_be_bytes())
     }
 
     pub fn set_i16(&mut self, offset: u32, value: i16) -> Result<()> {
-        self.put_bytes(offset, &value.to_be_bytes())
+        self.set_bytes(offset, &value.to_be_bytes())
     }
 
     pub fn set_u32(&mut self, offset: u32, value: u32) -> Result<()> {
-        self.put_bytes(offset, &value.to_be_bytes())
+        self.set_bytes(offset, &value.to_be_bytes())
     }
 
     pub fn set_i32(&mut self, offset: u32, value: i32) -> Result<()> {
-        self.put_bytes(offset, &value.to_be_bytes())
+        self.set_bytes(offset, &value.to_be_bytes())
     }
 
     pub fn set_f32(&mut self, offset: u32, value: f32) -> Result<()> {
-        self.put_bytes(offset, &value.to_be_bytes())
+        self.set_bytes(offset, &value.to_be_bytes())
     }
 
     /// Read a NUL-terminated UTF-8 string from a referenced sub-struct's data
@@ -326,5 +337,26 @@ mod tests {
         let s = HsdStruct::from_bytes(vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC]);
         assert_eq!(s.get_u32(0).unwrap(), 0x1234_5678);
         assert_eq!(s.get_u16(4).unwrap(), 0x9ABC);
+    }
+
+    #[test]
+    fn set_u8_u16_u32_round_trips() {
+        let mut s = HsdStruct::from_bytes(vec![0u8; 8]);
+        s.set_u8(0, 0xAB).unwrap();
+        s.set_u16(2, 0xCAFE).unwrap();
+        s.set_u32(4, 0xDEAD_BEEF).unwrap();
+        assert_eq!(s.get_byte(0).unwrap(), 0xAB);
+        assert_eq!(s.get_u16(2).unwrap(), 0xCAFE);
+        assert_eq!(s.get_u32(4).unwrap(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn set_bytes_oob_errors() {
+        let mut s = HsdStruct::from_bytes(vec![0u8; 4]);
+        assert!(s.set_bytes(0, &[0xAB, 0xCD]).is_ok());
+        // Write past end → error, not panic.
+        assert!(s.set_bytes(2, &[0xAB, 0xCD, 0xEF]).is_err());
+        // Single u8 OOB also errors.
+        assert!(s.set_u8(4, 0xFF).is_err());
     }
 }

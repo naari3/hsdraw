@@ -1,21 +1,27 @@
-//! POBJ writer — Phase 1 MVP.
+//! POBJ writer — Phase 1–3.
 //!
 //! Generates an `HSD_POBJ` (+ attribute table + per-attribute vertex
 //! buffers + GX display-list bytecode) from CPU-side mesh data.  Mirrors
-//! `HSDRaw/Tools/POBJ_Generator.cs` at the byte layout level, but
-//! intentionally limited:
+//! `HSDRaw/Tools/POBJ_Generator.cs` at the byte layout level, with the
+//! following design choices:
 //!
-//! - **single attribute group per POBJ** (no Next chain)
-//! - **TRIANGLES primitive only** — no triangle-strip optimization, the
-//!   bytecode is `0x90 (count*3) <per-vertex u16 indices>`.  Phase 2 lifts
-//!   this with a greedy stripification pass; for now the DL is bigger than
-//!   HSDLib's optimized output but renders correctly.
+//! - **single attribute group per POBJ** (no Next chain).  Multi-group
+//!   POBJs (one logical mesh spanning multiple influence sets) remain
+//!   on the roadmap.
+//! - **TRIANGLES + TRIANGLE_STRIP primitives**.  Phase 1 emits a single
+//!   `0x90 (Triangles)` group; Phase 2's `set_use_triangle_strips`
+//!   path adds a greedy stripification pass that produces `0x98
+//!   (TriangleStrip)` groups for chains of ≥ 4 vertices plus a
+//!   `Triangles` leftover.  Greedy, not vertex-cache-aware — HSDLib's
+//!   full `TriangleConverter` is tighter on large meshes.
 //! - **fixed attribute encoding** — POS / NRM as F32×3, CLR0 as RGBA8,
 //!   TEX0 as F32×2 — all `GX_INDEX16`.  Mesh data with more than 65,535
 //!   verts has to be split into multiple POBJs by the caller.
-//! - **no envelope rigging / shapeset** — MKGP2 course mesh is static
-//!   single-bind, which the caller provides via `JObj.set_dobj` after
-//!   `build()`.
+//! - **envelope rigging (Phase 3)** — `add_envelope` /
+//!   `add_envelope_index` for skinned meshes; sets
+//!   `POBJ_FLAG.ENVELOPE`, emits `GX_VA_PNMTXIDX` as a DIRECT 1-byte
+//!   per-vertex attribute.  Static (single-bind) meshes leave the
+//!   envelope arrays empty — no `PNMTXIDX`, no `ENVELOPE` flag.
 //!
 //! Per-attribute byte buffers are stored as separate "buffer" structs
 //! (`is_buffer_aligned = true`); the writer 0x20-aligns them and dedups
@@ -105,12 +111,31 @@ impl MeshBuilder {
         self.triangles.push([i0, i1, i2]);
     }
 
-    /// Sets `POBJ_FLAG.CULLBACK` on the produced POBJ.
+    /// **Deprecated** — historically set the CULLBACK bit on the
+    /// produced POBJ flags word, but the bit value (`1 << 14` = 0x4000)
+    /// lands inside HSDLib's `POBJ_TYPE_MASK` (0xE000) without matching
+    /// any valid POBJ-type encoding.  Renderers that dispatch POBJ
+    /// processing on `flags & POBJ_TYPE_MASK` see an unknown type and
+    /// skip texture-coord generation.  Cull mode is a `PeDesc` field
+    /// in HSDLib's pipeline; set it there on the parent `MObj` instead.
+    /// This setter is now a **no-op** at the POBJ.flags level.
+    #[deprecated(
+        note = "POBJ.flags 0x4000 trap — cull mode belongs on PeDesc, not POBJ.flags.  Setter is now a no-op."
+    )]
     pub fn set_cull_back(&mut self, on: bool) {
+        // Recorded but never folded into the output flags word.  Kept
+        // as a field for API back-compat in case a caller queries it
+        // for their own bookkeeping (no observable effect on the
+        // produced POBJ bytes).
         self.cull_back = on;
     }
 
-    /// Sets `POBJ_FLAG.CULLFRONT` on the produced POBJ.
+    /// **Deprecated** — same trap as [`Self::set_cull_back`] for the
+    /// `1 << 15` (0x8000) bit, which collides with `POBJ_FLAG.ENVELOPE`
+    /// in HSDLib's enum.  Now a no-op; use `PeDesc` for cull mode.
+    #[deprecated(
+        note = "POBJ.flags 0x8000 trap — collides with POBJ_FLAG.ENVELOPE.  Setter is now a no-op."
+    )]
     pub fn set_cull_front(&mut self, on: bool) {
         self.cull_front = on;
     }
@@ -133,8 +158,9 @@ impl MeshBuilder {
     /// renderer ends up using; the multiplier handles pos / normal /
     /// binormal triple — see HSDLib `POBJ_Generator`.
     ///
-    /// MKGP2 course meshes are static (single-bind) and don't need
-    /// this; it's here for Smash-style fighter use cases.
+    /// Static (single-bind) meshes don't need any envelopes — this
+    /// path is for skinned / animated meshes whose vertices follow
+    /// multiple bones.
     pub fn add_envelope(&mut self, weights: Vec<(JObj, f32)>) -> u32 {
         self.envelopes.push(weights);
         (self.envelopes.len() - 1) as u32
@@ -424,13 +450,14 @@ impl MeshBuilder {
             // 0x00 ClassName: null
             // 0x04 Next: null
             s.set_reference(0x08, Some(attr_struct));
+            // POBJ.flags is intentionally NOT written from cull_back /
+            // cull_front: those bits (0x4000 / 0x8000) collide with
+            // POBJ_TYPE_MASK and POBJ_FLAG.ENVELOPE in HSDLib's enum,
+            // so they break renderers that dispatch on the POBJ type
+            // nibble.  Cull mode belongs on PeDesc in HSDLib's
+            // pipeline; set it there.  See `set_cull_back` doc for the
+            // full trap analysis.
             let mut flags: u16 = 0;
-            if self.cull_back {
-                flags |= PObjFlag::CULLBACK.bits();
-            }
-            if self.cull_front {
-                flags |= PObjFlag::CULLFRONT.bits();
-            }
             if use_envelopes {
                 flags |= PObjFlag::ENVELOPE.bits();
             }
@@ -524,9 +551,9 @@ fn encode_dl_mixed(
 
     for strip in strips {
         if strip.len() > 0xFFFF {
-            // No real-world MKGP2 mesh approaches this, but a 16-bit
-            // strip-vertex-count overflow would silently truncate.  Bail
-            // out so the caller knows to split the source mesh up.
+            // GX strip-vertex count is a u16 in the DL bytecode, so a
+            // strip with more than 65,535 verts can't be expressed.
+            // Bail out so the caller knows to split the source mesh up.
             return Err(HsdError::malformed(
                 0,
                 "MeshBuilder::build: triangle-strip vertex count exceeds u16 (split into multiple POBJs)",

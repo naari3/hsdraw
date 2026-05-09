@@ -25,13 +25,13 @@ use hsdraw_core::common::{
 };
 use hsdraw_core::dat::RootNode;
 use hsdraw_core::gx::{
-    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexMapId, GxTlutFmt, GxWrapMode,
-    JObjFlag, MaterialRenderMode, TObjFlags,
+    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexGenSrc, GxTexMapId, GxTlutFmt,
+    GxWrapMode, JObjFlag, MaterialRenderMode, TObjFlags,
 };
 use hsdraw_core::hsd_struct::{StructRef, ptr_eq};
 use hsdraw_core::pobj_writer::MeshBuilder as CoreMeshBuilder;
 use hsdraw_core::{export, Dat as CoreDat};
-use pyo3::exceptions::{PyIOError, PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyDeprecationWarning, PyIOError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -280,6 +280,38 @@ impl PyHsdStruct {
         };
         self.inner.borrow_mut().set_reference(offset, resolved);
         Ok(())
+    }
+
+    // ----- raw bytes-level setters -------------------------------------
+    /// Single-byte write at `offset` (BE-irrelevant since u8 has no
+    /// endian).  Mirrors HSDLib `HSDStruct.SetByte(offset, v)`.  Out-
+    /// of-bounds writes raise `ValueError`.  Use this rather than
+    /// post-write file-byte find/replace patches when a typed setter
+    /// for the field doesn't exist yet.
+    fn set_u8(&self, offset: u32, value: u8) -> PyResult<()> {
+        self.inner.borrow_mut().set_u8(offset, value).map_err(map_err)
+    }
+
+    /// Big-endian u16 write at `offset`.  Mirrors HSDLib
+    /// `HSDStruct.SetInt16(offset, v)` (the convention in HSD .dat is
+    /// always big-endian).
+    fn set_u16(&self, offset: u32, value: u16) -> PyResult<()> {
+        self.inner.borrow_mut().set_u16(offset, value).map_err(map_err)
+    }
+
+    /// Big-endian u32 write at `offset`.  Mirrors HSDLib
+    /// `HSDStruct.SetInt32(offset, v)`.
+    fn set_u32(&self, offset: u32, value: u32) -> PyResult<()> {
+        self.inner.borrow_mut().set_u32(offset, value).map_err(map_err)
+    }
+
+    /// Bulk byte write at `offset`.  Errors if the write would land
+    /// past the struct's data length.
+    fn set_bytes(&self, offset: u32, data: &Bound<'_, PyBytes>) -> PyResult<()> {
+        self.inner
+            .borrow_mut()
+            .set_bytes(offset, data.as_bytes())
+            .map_err(map_err)
     }
 
     /// True iff `self` and `other` share the same underlying Rc.  Same
@@ -1196,6 +1228,27 @@ impl PyTObj {
             .map_err(map_err)
     }
 
+    /// `GXTexGenSrc` (offset 0x0C) as `u32`.  Controls which vertex
+    /// source feeds the texture-coord generator: 0=`GX_TG_POS` (world
+    /// position), 4=`GX_TG_TEX0` (POBJ TEX0 attribute), etc.  See
+    /// `hsdraw_core::gx::GxTexGenSrc` for the full enum.  Default
+    /// (0=`GX_TG_POS`) usually wants overriding to `GX_TG_TEX0` for
+    /// regular UV-mapped textures.
+    #[getter]
+    fn tex_gen_src(&self) -> PyResult<u32> {
+        CoreTObj::from_struct(self.inner.clone())
+            .tex_gen_src()
+            .map(u32::from)
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_tex_gen_src(&self, v: u32) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_tex_gen_src(GxTexGenSrc::from(v))
+            .map_err(map_err)
+    }
+
     // ----- transform triples --------------------------------------
     fn set_rotation(&self, rx: f32, ry: f32, rz: f32) -> PyResult<()> {
         CoreTObj::from_struct(self.inner.clone())
@@ -1290,6 +1343,101 @@ impl PyTObj {
     fn set_coord_type(&self, coord: u32) -> PyResult<()> {
         CoreTObj::from_struct(self.inner.clone())
             .set_coord_type(CoordType::from(coord))
+            .map_err(map_err)
+    }
+
+    // ----- named TObjFlags bit setters (RMW-preserving) ----------------
+    /// `LIGHTMAP_DIFFUSE` (bit 4).  RMW preserves every other bit and
+    /// the coord_type / color_op / alpha_op nibbles — call this rather
+    /// than `tobj.flags |= 0x10` so the nibbles aren't accidentally
+    /// stomped.  Some renderers skip texture sampling for TObjs
+    /// without this bit, so it's worth setting on freshly-allocated
+    /// TObjs unless the texture explicitly shouldn't drive diffuse.
+    #[pyo3(signature = (on, /))]
+    fn set_lightmap_diffuse(&self, on: bool) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_lightmap_diffuse(on)
+            .map_err(map_err)
+    }
+    fn is_lightmap_diffuse(&self) -> PyResult<bool> {
+        CoreTObj::from_struct(self.inner.clone())
+            .is_lightmap_diffuse()
+            .map_err(map_err)
+    }
+
+    /// `LIGHTMAP_SPECULAR` (bit 5).  Same RMW semantics as
+    /// `set_lightmap_diffuse`.
+    #[pyo3(signature = (on, /))]
+    fn set_lightmap_specular(&self, on: bool) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_lightmap_specular(on)
+            .map_err(map_err)
+    }
+    fn is_lightmap_specular(&self) -> PyResult<bool> {
+        CoreTObj::from_struct(self.inner.clone())
+            .is_lightmap_specular()
+            .map_err(map_err)
+    }
+
+    /// `LIGHTMAP_AMBIENT` (bit 6).
+    #[pyo3(signature = (on, /))]
+    fn set_lightmap_ambient(&self, on: bool) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_lightmap_ambient(on)
+            .map_err(map_err)
+    }
+    fn is_lightmap_ambient(&self) -> PyResult<bool> {
+        CoreTObj::from_struct(self.inner.clone())
+            .is_lightmap_ambient()
+            .map_err(map_err)
+    }
+
+    /// `LIGHTMAP_EXT` (bit 7).
+    #[pyo3(signature = (on, /))]
+    fn set_lightmap_ext(&self, on: bool) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_lightmap_ext(on)
+            .map_err(map_err)
+    }
+    fn is_lightmap_ext(&self) -> PyResult<bool> {
+        CoreTObj::from_struct(self.inner.clone())
+            .is_lightmap_ext()
+            .map_err(map_err)
+    }
+
+    /// `LIGHTMAP_SHADOW` (bit 8).
+    #[pyo3(signature = (on, /))]
+    fn set_lightmap_shadow(&self, on: bool) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_lightmap_shadow(on)
+            .map_err(map_err)
+    }
+    fn is_lightmap_shadow(&self) -> PyResult<bool> {
+        CoreTObj::from_struct(self.inner.clone())
+            .is_lightmap_shadow()
+            .map_err(map_err)
+    }
+
+    /// `BUMP` (bit 24).
+    #[pyo3(signature = (on, /))]
+    fn set_bump(&self, on: bool) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_bump(on)
+            .map_err(map_err)
+    }
+    fn is_bump(&self) -> PyResult<bool> {
+        CoreTObj::from_struct(self.inner.clone())
+            .is_bump()
+            .map_err(map_err)
+    }
+
+    /// Generic single-bit RMW for any `TObjFlags` mask.  Foundation
+    /// for the named setters above; exposed for callers that want to
+    /// toggle a custom mask without going through the raw u32 path.
+    #[pyo3(signature = (mask, on))]
+    fn set_flag_bit(&self, mask: u32, on: bool) -> PyResult<()> {
+        CoreTObj::from_struct(self.inner.clone())
+            .set_flag_bit(TObjFlags::from_bits_retain(mask), on)
             .map_err(map_err)
     }
 
@@ -1555,12 +1703,38 @@ impl PyMeshBuilder {
         self.inner.borrow_mut().add_triangle(i0, i1, i2);
     }
 
-    fn set_cull_back(&self, on: bool) {
+    /// **Deprecated** — emits `DeprecationWarning` and is now a no-op
+    /// at the POBJ.flags level.  The historical 0x4000 bit lands inside
+    /// HSDLib's `POBJ_TYPE_MASK` (0xE000) without matching any valid
+    /// POBJ-type encoding, so renderers dispatching on the type nibble
+    /// treat affected POBJs as unknown and drop texture-coord
+    /// generation.  Set cull mode via `PeDesc` on the parent `MObj`
+    /// instead.
+    fn set_cull_back(&self, py: Python<'_>, on: bool) -> PyResult<()> {
+        PyErr::warn(
+            py,
+            &py.get_type::<PyDeprecationWarning>(),
+            c"MeshBuilder.set_cull_back is deprecated — POBJ.flags 0x4000 collides with POBJ_TYPE_MASK and is mis-handled by renderers dispatching on the POBJ type nibble.  Use PeDesc for cull mode.  This call is now a no-op.",
+            1,
+        )?;
+        #[allow(deprecated)]
         self.inner.borrow_mut().set_cull_back(on);
+        Ok(())
     }
 
-    fn set_cull_front(&self, on: bool) {
+    /// **Deprecated** — same trap as [`Self::set_cull_back`] for the
+    /// 0x8000 bit (collides with `POBJ_FLAG.ENVELOPE`).  No-op at the
+    /// POBJ.flags level; emits `DeprecationWarning`.
+    fn set_cull_front(&self, py: Python<'_>, on: bool) -> PyResult<()> {
+        PyErr::warn(
+            py,
+            &py.get_type::<PyDeprecationWarning>(),
+            c"MeshBuilder.set_cull_front is deprecated — POBJ.flags 0x8000 collides with POBJ_FLAG.ENVELOPE.  Use PeDesc for cull mode.  This call is now a no-op.",
+            1,
+        )?;
+        #[allow(deprecated)]
         self.inner.borrow_mut().set_cull_front(on);
+        Ok(())
     }
 
     /// Toggle Phase 2 greedy `TRIANGLE_STRIP` decomposition.  On by
@@ -1676,26 +1850,38 @@ fn export_scene_json(
 }
 
 /// Encode RGBA8 source bytes into a GX texture format payload.
-/// Wraps `hsdraw_core::gx_image::encode_image`: pass `format` as the
-/// `GxTexFmt` integer (4=RGB565, 5=RGB5A3, 6=RGBA8, 14=CMP) and the
-/// raw RGBA8 source as `bytes` of exactly `4 * width * height` bytes.
-/// Output dimensions get padded to the format's natural tile boundary
-/// (4 or 8), so the byte count matches what `decode_image` consumes.
-/// Other formats (I4/I8/IA4/IA8/CIxx) raise `ValueError`.  Useful for
-/// pipelines that already have an RGBA8 source — image_data into
-/// `Image.set_image_data_bytes(gx_encode(...))`.
+/// Wraps `hsdraw_core::gx_image::encode_image_with_options`: pass
+/// `format` as the `GxTexFmt` integer (4=RGB565, 5=RGB5A3, 6=RGBA8,
+/// 14=CMP) and the raw RGBA8 source as `bytes` of exactly
+/// `4 * width * height` bytes.  Output dimensions get padded to the
+/// format's natural tile boundary (4 or 8), so the byte count matches
+/// what `decode_image` consumes.  Other formats (I4/I8/IA4/IA8/CIxx)
+/// raise `ValueError`.
+///
+/// `swap_rb_for_rgb5a3` (kwarg, default `False`): pre-swap R↔B in the
+/// source RGBA before the RGB5A3 encode loop.  Use when the target
+/// renderer's RGB5A3 sampler reads channels in BGR order; no effect
+/// on RGBA8 / RGB565 / CMP.  See `EncodeOptions::swap_rb_for_rgb5a3`.
 #[pyfunction]
-#[pyo3(signature = (format, width, height, rgba, /))]
+#[pyo3(signature = (format, width, height, rgba, /, swap_rb_for_rgb5a3 = false))]
 fn gx_encode<'py>(
     py: Python<'py>,
     format: u32,
     width: u32,
     height: u32,
     rgba: &Bound<'_, PyBytes>,
+    swap_rb_for_rgb5a3: bool,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let fmt = GxTexFmt::from(format);
-    let out = hsdraw_core::gx_image::encode_image(fmt, width, height, rgba.as_bytes())
-        .map_err(|e| PyValueError::new_err(format!("gx_encode: {:?}", e)))?;
+    let opts = hsdraw_core::gx_image::EncodeOptions { swap_rb_for_rgb5a3 };
+    let out = hsdraw_core::gx_image::encode_image_with_options(
+        fmt,
+        width,
+        height,
+        rgba.as_bytes(),
+        opts,
+    )
+    .map_err(|e| PyValueError::new_err(format!("gx_encode: {:?}", e)))?;
     Ok(PyBytes::new(py, &out))
 }
 

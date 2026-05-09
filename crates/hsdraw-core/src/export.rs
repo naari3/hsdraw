@@ -420,10 +420,19 @@ impl<'tex> Exporter<'tex> {
                 cursor += n;
             }
 
-            // POBJ_FLAG cull mode resolution.
+            // POBJ_FLAG cull mode resolution.  HSDLib's CULLBACK /
+            // CULLFRONT bits are deprecated for write (the writer no
+            // longer emits them — see `pobj_writer::set_cull_back`),
+            // but legacy course .dat files use the same bit positions
+            // for their own cull encoding, so we keep the read-side
+            // interpretation for csx-parity JSON output.
+            #[allow(deprecated)]
+            let flags_cullback = PObjFlag::CULLBACK;
+            #[allow(deprecated)]
+            let flags_cullfront = PObjFlag::CULLFRONT;
             let flags = pobj.flags()?;
-            let cull_back = flags.contains(PObjFlag::CULLBACK);
-            let cull_front = flags.contains(PObjFlag::CULLFRONT);
+            let cull_back = flags.contains(flags_cullback);
+            let cull_front = flags.contains(flags_cullfront);
             let cull = match (cull_back, cull_front) {
                 (true, true) => "BOTH",
                 (true, false) => "BACK",

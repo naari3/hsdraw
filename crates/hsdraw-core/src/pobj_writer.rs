@@ -61,6 +61,14 @@ pub struct MeshBuilder {
     /// Per-vertex envelope index (parallel to `positions`).  Required
     /// (with same length as `positions`) when `envelopes` is non-empty.
     envelope_indices: Vec<u32>,
+    /// Direct `GX_VA_PNMTXIDX` byte per vertex — the no-envelope path.
+    /// `Some(vec)` → emit `GX_VA_PNMTXIDX` as DIRECT 1-byte without
+    /// touching `POBJ_FLAG.ENVELOPE` and without attaching an
+    /// envelope-pointer array.  Mutually exclusive with `envelopes`
+    /// (build() rejects the combination).  Required length when
+    /// `Some` is `n_verts`; `add_pos_mat_idx` pushes one byte per
+    /// vertex, `set_use_pos_mat_idx(true)` initializes the vec.
+    pos_mat_idx: Option<Vec<u8>>,
 }
 
 impl Default for MeshBuilder {
@@ -76,6 +84,7 @@ impl Default for MeshBuilder {
             use_triangle_strips: true,
             envelopes: Vec::new(),
             envelope_indices: Vec::new(),
+            pos_mat_idx: None,
         }
     }
 }
@@ -178,6 +187,41 @@ impl MeshBuilder {
         self.envelopes.len()
     }
 
+    /// Toggle the no-envelope `GX_VA_PNMTXIDX` emission path (off by
+    /// default).  When `true`, the builder will emit a DIRECT 1-byte
+    /// `GX_VA_PNMTXIDX` attribute populated from per-vertex matrix
+    /// indices pushed via [`Self::add_pos_mat_idx`], **without**
+    /// setting `POBJ_FLAG.ENVELOPE` and without attaching an
+    /// envelope-pointer array at POBJ + 0x14.  This is the path for
+    /// statically-bound meshes that nonetheless need a per-vertex
+    /// matrix-index byte in the DL bytecode (i.e. consumers that
+    /// expect `GX_VA_PNMTXIDX` to participate in the vertex layout
+    /// regardless of whether the mesh is skinned).
+    ///
+    /// Mutually exclusive with the envelope path: `build()` rejects
+    /// the combination of non-empty `envelopes` and an active
+    /// `pos_mat_idx`.  Toggling off (`false`) clears any indices
+    /// already pushed.
+    pub fn set_use_pos_mat_idx(&mut self, on: bool) {
+        if on {
+            if self.pos_mat_idx.is_none() {
+                self.pos_mat_idx = Some(Vec::new());
+            }
+        } else {
+            self.pos_mat_idx = None;
+        }
+    }
+
+    /// Push one `GX_VA_PNMTXIDX` byte for the next vertex.  Implicitly
+    /// activates the no-envelope PNMTXIDX path (= as if
+    /// `set_use_pos_mat_idx(true)` had been called first).  When the
+    /// path is active, `pos_mat_idx` length must equal `positions`
+    /// length at `build()` time; the validator complains otherwise.
+    pub fn add_pos_mat_idx(&mut self, idx: u8) {
+        let v = self.pos_mat_idx.get_or_insert_with(Vec::new);
+        v.push(idx);
+    }
+
     /// Convenience: how many positions have been pushed.
     pub fn vertex_count(&self) -> usize {
         self.positions.len()
@@ -242,6 +286,13 @@ impl MeshBuilder {
 
         // ---------- Phase 3 envelope validation ----------
         let use_envelopes = !self.envelopes.is_empty();
+        let use_direct_pnmtx = self.pos_mat_idx.is_some();
+        if use_envelopes && use_direct_pnmtx {
+            return Err(HsdError::malformed(
+                0,
+                "MeshBuilder::build: envelopes and pos_mat_idx are mutually exclusive — use one or the other",
+            ));
+        }
         if use_envelopes {
             if self.envelope_indices.len() != n_verts {
                 return Err(HsdError::malformed(
@@ -271,6 +322,14 @@ impl MeshBuilder {
                 0,
                 "MeshBuilder::build: envelope_indices added without any envelopes",
             ));
+        }
+        if let Some(ref idxs) = self.pos_mat_idx {
+            if idxs.len() != n_verts {
+                return Err(HsdError::malformed(
+                    0,
+                    "MeshBuilder::build: pos_mat_idx count != position count",
+                ));
+            }
         }
 
         // ---------- per-attribute byte buffers --------------------------
@@ -311,12 +370,28 @@ impl MeshBuilder {
         // that on the read side in `gx_dl::read_attribute_at`.
         let mut attrs: Vec<AttrSpec> = Vec::new();
 
-        // PNMTXIDX (Phase 3): when envelopes are in use, emit this as
-        // the FIRST attribute so the per-vertex DL bytecode reads
-        // `<1 byte PNMTXIDX><N×2 byte indices>` (the order matches
-        // HSDLib `POBJ_Generator`).  AttributeType = GX_DIRECT, no
-        // buffer — the value lives inline in the DL stream.
-        if use_envelopes {
+        // Compute the per-vertex `GX_VA_PNMTXIDX` byte source, if any.
+        // Two sources, mutually exclusive:
+        //   (a) envelope path — `envelope_indices[i] * 3` per HSDLib's
+        //       POBJ_Generator multiplier (matrix triple slot).
+        //   (b) direct path  — raw `pos_mat_idx[i]` byte.
+        let pnmtx_bytes: Option<Vec<u8>> = if use_envelopes {
+            Some(
+                self.envelope_indices
+                    .iter()
+                    .map(|&e| (e * 3) as u8)
+                    .collect(),
+            )
+        } else {
+            self.pos_mat_idx.clone()
+        };
+
+        // PNMTXIDX: when in use (envelope path or direct path), emit as
+        // the FIRST attribute so per-vertex DL bytecode reads
+        // `<1 byte PNMTXIDX><N×2 byte indices>` (matches HSDLib
+        // `POBJ_Generator`).  AttributeType = GX_DIRECT, no buffer —
+        // the value lives inline in the DL stream.
+        if pnmtx_bytes.is_some() {
             attrs.push(AttrSpec {
                 name: GxAttribName::GX_VA_PNMTXIDX,
                 kind: GxAttribType::GX_DIRECT,
@@ -409,14 +484,10 @@ impl MeshBuilder {
         // The MVP emits the same vertex index for every attribute (i.e.,
         // POS[i] / NRM[i] / CLR[i] / UV[i] all addressed by i) — that's
         // what the reader expects in the simplest decode path.
-        let env_per_vertex: Option<&[u32]> = if use_envelopes {
-            Some(&self.envelope_indices)
-        } else {
-            None
-        };
+        let pnmtx_slice: Option<&[u8]> = pnmtx_bytes.as_deref();
         let dl_buf = if self.use_triangle_strips {
             let (strips, leftover) = build_strips(&self.triangles, MIN_STRIP_VERTS);
-            encode_dl_mixed(&strips, &leftover, &attrs, env_per_vertex)?
+            encode_dl_mixed(&strips, &leftover, &attrs, pnmtx_slice)?
         } else {
             // Single-group path needs a u16-fitting vertex count.
             let n_dl_verts = self.triangles.len() * 3;
@@ -426,7 +497,7 @@ impl MeshBuilder {
                     "MeshBuilder::build: triangle count exceeds GX primitive group limit (split into multiple POBJs)",
                 ));
             }
-            encode_dl_triangles(&self.triangles, &attrs, env_per_vertex)
+            encode_dl_triangles(&self.triangles, &attrs, pnmtx_slice)
         };
         let dl_size_in_32_units = (dl_buf.len() / 32) as i16;
         let dl_ref = make_buffer_struct(dl_buf);
@@ -521,7 +592,7 @@ fn make_buffer_struct(bytes: Vec<u8>) -> StructRef {
 fn encode_dl_triangles(
     triangles: &[[u32; 3]],
     attrs: &[AttrSpec],
-    env_per_vertex: Option<&[u32]>,
+    pnmtx_per_vertex: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let n_dl_verts = (triangles.len() * 3) as u16;
@@ -529,7 +600,7 @@ fn encode_dl_triangles(
     out.extend_from_slice(&n_dl_verts.to_be_bytes());
     for tri in triangles {
         for &vert_idx in tri {
-            write_vertex_attrs(&mut out, vert_idx, attrs, env_per_vertex);
+            write_vertex_attrs(&mut out, vert_idx, attrs, pnmtx_per_vertex);
         }
     }
     finalize_dl_buffer(&mut out);
@@ -545,7 +616,7 @@ fn encode_dl_mixed(
     strips: &[Vec<u32>],
     leftover: &[[u32; 3]],
     attrs: &[AttrSpec],
-    env_per_vertex: Option<&[u32]>,
+    pnmtx_per_vertex: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
 
@@ -562,7 +633,7 @@ fn encode_dl_mixed(
         out.push(0x98); // GX_DRAW_TRIANGLE_STRIP
         out.extend_from_slice(&(strip.len() as u16).to_be_bytes());
         for &vert_idx in strip {
-            write_vertex_attrs(&mut out, vert_idx, attrs, env_per_vertex);
+            write_vertex_attrs(&mut out, vert_idx, attrs, pnmtx_per_vertex);
         }
     }
 
@@ -578,7 +649,7 @@ fn encode_dl_mixed(
         out.extend_from_slice(&(n_dl_verts as u16).to_be_bytes());
         for tri in leftover {
             for &vert_idx in tri {
-                write_vertex_attrs(&mut out, vert_idx, attrs, env_per_vertex);
+                write_vertex_attrs(&mut out, vert_idx, attrs, pnmtx_per_vertex);
             }
         }
     }
@@ -591,9 +662,12 @@ fn encode_dl_mixed(
 /// triangle / leftover paths share one definition.  For each attr in
 /// declaration order:
 ///
-///   - `GX_DIRECT` + `GX_VA_PNMTXIDX` → 1 byte = `(env_idx * 3) as u8`.
-///     `env_per_vertex` must be `Some(_)` and `vert_idx` must be in
-///     range; the validation pass in `build()` already enforces this.
+///   - `GX_DIRECT` + `GX_VA_PNMTXIDX` → 1 byte from
+///     `pnmtx_per_vertex[vert_idx]`.  The byte source is precomputed in
+///     `build()` (`envelope_indices[i] * 3` for the envelope path, raw
+///     `pos_mat_idx[i]` for the direct path).  Must be `Some(_)` and
+///     long enough to cover `vert_idx`; the validation pass in
+///     `build()` already enforces this.
 ///   - `GX_INDEX16` → 2 bytes BE = `vert_idx as u16`.
 ///   - Other kinds aren't emitted by the Phase 1–3 writer (callers
 ///     should never see them on this path).
@@ -601,17 +675,16 @@ fn write_vertex_attrs(
     out: &mut Vec<u8>,
     vert_idx: u32,
     attrs: &[AttrSpec],
-    env_per_vertex: Option<&[u32]>,
+    pnmtx_per_vertex: Option<&[u8]>,
 ) {
     let idx16 = vert_idx as u16;
     for a in attrs {
         match a.kind {
             GxAttribType::GX_DIRECT => {
                 if a.name == GxAttribName::GX_VA_PNMTXIDX {
-                    let env = env_per_vertex
-                        .expect("PNMTXIDX without env_per_vertex is a writer bug");
-                    let pid = (env[vert_idx as usize] * 3) as u8;
-                    out.push(pid);
+                    let bytes = pnmtx_per_vertex
+                        .expect("PNMTXIDX without pnmtx_per_vertex is a writer bug");
+                    out.push(bytes[vert_idx as usize]);
                 }
                 // DIRECT non-PNMTXIDX (e.g. inline color) isn't emitted
                 // by Phase 1–3; future widening hooks here.

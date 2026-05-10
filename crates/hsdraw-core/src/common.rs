@@ -195,6 +195,12 @@ impl MObj {
     /// alpha = 1.0, shininess = 50.0 (HSDLib's default in `Trim`),
     /// no textures, no PE descriptor.  Useful as a placeholder when
     /// the addon doesn't yet have a real material to point at.
+    ///
+    /// Caveat: some HSD-format consumers will not bind any TObj on a
+    /// MObj that lacks `LIGHTMAP_DIFFUSE` (a TObj-side flag), so this
+    /// preset isn't suitable for textured rendering even after a TObj
+    /// is later attached.  Use [`Self::allocate_textured`] for the
+    /// textured-render preset.
     pub fn allocate_unlit_color(r: u8, g: u8, b: u8, a: u8) -> Self {
         let mobj = Self::allocate_default();
         let _ = mobj.set_render_flags(
@@ -205,6 +211,61 @@ impl MObj {
         let _ = mat.set_alpha(1.0);
         let _ = mat.set_shininess(50.0);
         mobj.set_material(Some(mat));
+        mobj
+    }
+
+    /// "Textured lit" preset: a one-call MObj + TObj wiring path for
+    /// the common case of "give me a lit mesh that samples one
+    /// texture".  The caller supplies a pre-built [`Material`]
+    /// (e.g. via `Material::allocate(amb, dif, spc, alpha,
+    /// shininess)`) and a pre-built [`Image`].
+    ///
+    /// What this builds:
+    ///   - `MObj.render_flags` = `CONSTANT | DIFFUSE | TEX0 | ALPHA_MAT`
+    ///     — the bit pattern HSD-format consumers use to enable both
+    ///     the diffuse-lighting stage and the TEX0 sampler.
+    ///   - `Material` is attached as-is (caller controls the colors).
+    ///   - A fresh `TObj` with: `tex_map_id = GX_TEXMAP0`,
+    ///     `tex_gen_src = GX_TG_TEX0`, `coord_type = UV`,
+    ///     `color_op = MODULATE`, `alpha_op = MODULATE`, `scale =
+    ///     (1, 1, 1)`, `wrap_s = wrap_t = REPEAT`, `repeat_s =
+    ///     repeat_t = 1`, `mag_filter = GX_LINEAR`, `blending =
+    ///     1.0`, and `LIGHTMAP_DIFFUSE` set.  These are the field
+    ///     values widely seen on textured POBJs across the HSD
+    ///     vanilla course corpus.
+    ///   - `Image` is attached as `TObj.image_data`.
+    ///
+    /// What this does **not** wire up:
+    ///   - PE descriptor (alpha test / blend mode) — caller attaches
+    ///     a `PeDesc` separately if needed.
+    ///   - TLUT — for paletted image formats the caller has to
+    ///     attach `Tlut` separately via `tobj.set_tlut_data(...)`.
+    pub fn allocate_textured(material: Material, image: Image) -> Self {
+        let mobj = Self::allocate_default();
+        let _ = mobj.set_render_flags(
+            MaterialRenderMode::CONSTANT
+                | MaterialRenderMode::DIFFUSE
+                | MaterialRenderMode::TEX0
+                | MaterialRenderMode::ALPHA_MAT,
+        );
+        mobj.set_material(Some(material));
+
+        let tobj = TObj::allocate_default();
+        let _ = tobj.set_tex_map_id(GxTexMapId::GX_TEXMAP0);
+        let _ = tobj.set_tex_gen_src(GxTexGenSrc::GX_TG_TEX0);
+        let _ = tobj.set_scale(1.0, 1.0, 1.0);
+        let _ = tobj.set_wrap_s(GxWrapMode::REPEAT);
+        let _ = tobj.set_wrap_t(GxWrapMode::REPEAT);
+        let _ = tobj.set_repeat_s(1);
+        let _ = tobj.set_repeat_t(1);
+        let _ = tobj.set_blending(1.0);
+        let _ = tobj.set_mag_filter(GxTexFilter::GX_LINEAR);
+        let _ = tobj.set_color_operation(ColorMap::MODULATE);
+        let _ = tobj.set_alpha_operation(AlphaMap::MODULATE);
+        let _ = tobj.set_lightmap_diffuse(true);
+        tobj.set_image_data(Some(image));
+
+        mobj.set_textures(Some(tobj));
         mobj
     }
 
@@ -247,28 +308,64 @@ impl MObj {
 accessor!(Material);
 
 impl Material {
+    /// Ambient color RGBA8 (offset 0x00..0x04).  HSDLib `HSD_Material.AMB_*`
+    /// — the `GX_AMB` register feed for the GX hardware lighting stage.
     pub fn amb_rgba(&self) -> Result<[u8; 4]> {
         let s = self.s();
         Ok([s.get_byte(0x00)?, s.get_byte(0x01)?, s.get_byte(0x02)?, s.get_byte(0x03)?])
     }
+    /// Diffuse color RGBA8 (offset 0x04..0x08).  HSDLib
+    /// `HSD_Material.DIF_*` — the `GX_DIF` register feed.
     pub fn dif_rgba(&self) -> Result<[u8; 4]> {
         let s = self.s();
         Ok([s.get_byte(0x04)?, s.get_byte(0x05)?, s.get_byte(0x06)?, s.get_byte(0x07)?])
     }
+    /// Specular color RGBA8 (offset 0x08..0x0C).  HSDLib
+    /// `HSD_Material.SPC_*` — the `GX_SPC` register feed.
     pub fn spc_rgba(&self) -> Result<[u8; 4]> {
         let s = self.s();
         Ok([s.get_byte(0x08)?, s.get_byte(0x09)?, s.get_byte(0x0A)?, s.get_byte(0x0B)?])
     }
+    /// Material alpha multiplier f32 (offset 0x0C).  Multiplies into
+    /// every TEV stage's `RAS` source α.  Sensible value range [0.0, 1.0].
     pub fn alpha(&self) -> Result<f32> { self.s().get_f32(0x0C) }
+    /// Specular shininess f32 (offset 0x10).  HSDLib's "Phong cosine"
+    /// exponent — higher values produce a tighter highlight.  Sensible
+    /// value range roughly [1.0, 200.0].
     pub fn shininess(&self) -> Result<f32> { self.s().get_f32(0x10) }
 
     // ----- mutators ------------------------------------------------
     /// Allocate a fresh HSD_Material: 0x14 bytes, all-zero fields
     /// (ambient/diffuse/specular = (0,0,0,0), alpha = 0.0, shininess = 0.0).
     /// Mirrors HSDLib `new HSD_Material()` post-ctor state.  Pair with
-    /// `set_*_rgba` / `set_alpha` / `set_shininess` for sensible values.
+    /// `set_*_rgba` / `set_alpha` / `set_shininess` for sensible values,
+    /// or use [`Self::allocate`] for a one-call named-argument
+    /// constructor.
     pub fn allocate_default() -> Self {
         Material::from_struct(HsdStruct::with_capacity(0x14).into_ref())
+    }
+
+    /// One-call constructor: allocate + set every field in a single
+    /// shot.  Equivalent to `allocate_default()` + 5 setters.  Use for
+    /// the common case of building a fresh Material from known values
+    /// (e.g. importing from a Blender BSDF).  Field byte-order:
+    /// ambient / diffuse / specular each take RGBA8 (4 bytes each
+    /// = 12 bytes total at offsets 0x00 / 0x04 / 0x08), then α (f32 at
+    /// 0x0C), then shininess (f32 at 0x10).
+    pub fn allocate(
+        amb: [u8; 4],
+        dif: [u8; 4],
+        spc: [u8; 4],
+        alpha: f32,
+        shininess: f32,
+    ) -> Result<Self> {
+        let mat = Self::allocate_default();
+        mat.set_amb_rgba(amb)?;
+        mat.set_dif_rgba(dif)?;
+        mat.set_spc_rgba(spc)?;
+        mat.set_alpha(alpha)?;
+        mat.set_shininess(shininess)?;
+        Ok(mat)
     }
 
     pub fn set_amb_rgba(&self, rgba: [u8; 4]) -> Result<()> {
@@ -396,6 +493,20 @@ impl PObj {
             return Ok(None);
         }
         Ok(self.ref_at::<JObj>(0x14))
+    }
+
+    /// Overwrite the `Flags` u16 at offset 0x0C in place.  Use sparingly
+    /// — `MeshBuilder::build` already produces the correct flag value
+    /// for the mesh shape it's emitting.  This setter exists for the
+    /// case where the caller needs to write a bit pattern that HSDLib's
+    /// canonical `POBJ_FLAG` enum doesn't cover cleanly (e.g. game-
+    /// specific repurposing of bits otherwise reserved by `POBJ_TYPE_MASK`
+    /// or `POBJ_FLAG.ENVELOPE`).  Caller is responsible for keeping the
+    /// 0x14 reference consistent with whatever bits they're setting —
+    /// e.g. don't toggle `ENVELOPE` on without also wiring a valid
+    /// envelope-pointer array at 0x14.
+    pub fn set_flags(&self, flags: PObjFlag) -> Result<()> {
+        self.0.borrow_mut().set_u16(0x0C, flags.bits())
     }
 }
 

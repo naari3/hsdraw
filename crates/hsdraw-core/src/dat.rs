@@ -43,9 +43,9 @@ impl Dat {
         self.roots.iter().find(|r| r.name == name)
     }
 
-    /// Convenience for the Blender pipeline: the `scene_data` root if any
-    /// (every MKGP2 course .dat has it).  The accessor layer turns this into
-    /// an `Sobj`.
+    /// Convenience: the `scene_data` root if any — the conventional
+    /// root name for HSD-format scene files.  The accessor layer turns
+    /// this into an `Sobj`.
     pub fn scene_data(&self) -> Option<&RootNode> {
         self.root("scene_data")
     }
@@ -245,8 +245,8 @@ impl<'a> Parser<'a> {
             // We're more permissive: we silently drop reloc entries whose
             // pointer doesn't have 4 bytes of room.  The cost is ignoring a
             // truly bogus reloc; the gain is we keep parsing a partially-
-            // garbage file far enough to be useful.  None of the vanilla
-            // MKGP2 corpus hits this branch.
+            // garbage file far enough to be useful.  Well-formed corpora
+            // observed so far don't hit this branch.
             let target_rel = match self.read_i32(pointer_pos as u64) {
                 Ok(v) => v,
                 Err(_) => continue,

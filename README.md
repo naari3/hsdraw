@@ -21,8 +21,8 @@ side mesh data, and serialize back — all without depending on
 | **PyO3** | abi3-py37 wheel covers Python 3.7+; identity-aware `__eq__` / `__hash__` on every typed view |
 | **CI** | `cargo test` on Linux / macOS / Windows + 5-platform abi3 wheel matrix via maturin |
 
-Test totals: **80 passing** env-free (20 unit + 12 mutation primitive +
-4 parity + 15 POBJ writer round-trip + 14 MObj / Material / PeDesc /
+Test totals: **87 passing** env-free (20 unit + 12 mutation primitive +
+4 parity + 20 POBJ writer round-trip + 16 MObj / Material / PeDesc /
 TObj / Image / Lod round-trip + 13 GX texture encoder + 2 from-scratch
 chain).  With `MKGP2_FILES_DIR` + `MKGP2_PATCH_DIR` set, an additional
 6 csx-parity courses + 9-file writer round-trip corpus run.
@@ -34,8 +34,10 @@ chain).  With `MKGP2_FILES_DIR` + `MKGP2_PATCH_DIR` set, an additional
 | `Dat` | `add_root`, `remove_root`, `rename_root`, `repoint_root`, `find_root_for`, `scene_data`, `alloc_scene_data`, `write` |
 | `JObj` | `alloc`, `set_child`, `set_next`, `set_dobj`, `flags`, `tx … sz`, `local_trs` / `set_local_trs` |
 | `DObj` | `alloc`, `set_mobj`, `set_pobj`, `set_next` |
-| `MObj` | `alloc`, `alloc_unlit_color`, `set_material`, `set_textures`, `set_pe_desc`, `render_flags` |
-| `Material` | `alloc`, `{amb,dif,spc}_rgba`, `alpha`, `shininess` |
+| `MObj` | `alloc`, `alloc_unlit_color`, `alloc_textured(material, image)` (lit-textured preset), `set_material`, `set_textures`, `set_pe_desc`, `render_flags` |
+| `Material` | `alloc`, `new(amb=…, dif=…, spc=…, alpha=…, shininess=…)` (named-arg ctor), `{amb,dif,spc}_rgba`, `alpha`, `shininess` |
+| `Pobj` | `flags` (property; settable for non-canonical bit patterns), `display_list_size`, `set_next`, `to_dict()` |
+| `MeshBuilder` | `from_arrays(positions=…, triangles=…, normals=…, colors=…, uvs=…)` (bulk path), `add_position` / `add_normal` / `add_color` / `add_uv` / `add_triangle`, `add_envelope` / `add_envelope_index`, `set_use_pos_mat_idx` / `add_pos_mat_idx` (envelope-free `GX_VA_PNMTXIDX` path), `set_use_triangle_strips`, `build` |
 | `PeDesc` | `alloc`, `blend_mode`, `src_factor`, `dst_factor`, `depth_function`, `alpha_*`, … |
 | `SObj` | `alloc`, `jobj_descs`, `set_jobj_descs`, `jobj_descs_array` |
 | `JObjDesc` | `alloc`, `root_joint`, `set_root_joint` |

@@ -662,3 +662,142 @@ fn deprecated_set_cull_back_does_not_write_pobj_flags() {
         bits
     );
 }
+
+#[test]
+fn pos_mat_idx_emits_pnmtxidx_without_envelope_flag() {
+    // Pin #3: set_use_pos_mat_idx(true) + add_pos_mat_idx(byte) emits
+    // a DIRECT 1-byte GX_VA_PNMTXIDX attribute for every vertex
+    // *without* setting POBJ_FLAG.ENVELOPE.  Verifies:
+    //   - POBJ.flags has bit 0x8000 (ENVELOPE) clear
+    //   - DL bytecode contains the per-vertex matrix index byte we set
+    //   - 0x14 reference (where envelope-pointer-array would live) is null
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.0, 0.0);
+    mb.add_position(0.0, 1.0, 0.0);
+    mb.add_triangle(0, 1, 2);
+    mb.set_use_pos_mat_idx(true);
+    mb.add_pos_mat_idx(0);
+    mb.add_pos_mat_idx(0);
+    mb.add_pos_mat_idx(0);
+    let pobj = mb.build().expect("build");
+    assert_eq!(
+        pobj.flags().unwrap().bits() & 0x8000,
+        0,
+        "ENVELOPE bit must be clear"
+    );
+    let s = pobj.0.borrow();
+    assert!(
+        s.get_reference(0x14).is_none(),
+        "0x14 (envelope array) must be null without envelopes"
+    );
+    drop(s);
+
+    // The DL bytecode for one Triangles group of 3 verts should be:
+    //   0x90 (TRIANGLES) + 0x0003 (BE u16 vert count)
+    //   per-vertex: 1 byte PNMTXIDX + 2 bytes POS index BE = 3 bytes
+    //   tail: 0x00 EOF + 0x20 alignment padding
+    let dl = pobj.display_list_buffer().expect("dl");
+    assert_eq!(dl[0], 0x90, "primitive header is TRIANGLES");
+    assert_eq!(&dl[1..3], &0x0003u16.to_be_bytes(), "vertex count u16");
+    // Per-vertex stream: 3 verts × (1 PNMTX + 2 POS) = 9 bytes
+    // Bytes 3, 6, 9 should be the PNMTX bytes (0 each); bytes
+    // 4..6 / 7..9 / 10..12 are the POS indices 0/1/2 BE.
+    assert_eq!(dl[3], 0, "vert 0 PNMTXIDX byte");
+    assert_eq!(&dl[4..6], &0x0000u16.to_be_bytes(), "vert 0 POS idx");
+    assert_eq!(dl[6], 0, "vert 1 PNMTXIDX byte");
+    assert_eq!(&dl[7..9], &0x0001u16.to_be_bytes(), "vert 1 POS idx");
+    assert_eq!(dl[9], 0, "vert 2 PNMTXIDX byte");
+    assert_eq!(&dl[10..12], &0x0002u16.to_be_bytes(), "vert 2 POS idx");
+}
+
+#[test]
+fn pos_mat_idx_byte_value_round_trips_in_dl() {
+    // Same shape as above but with non-zero PNMTXIDX values to
+    // confirm the raw byte is written verbatim (no `* 3` multiplier
+    // — that's the envelope path's HSDLib convention).
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.0, 0.0);
+    mb.add_position(0.0, 1.0, 0.0);
+    mb.add_triangle(0, 1, 2);
+    mb.add_pos_mat_idx(15);
+    mb.add_pos_mat_idx(33);
+    mb.add_pos_mat_idx(7);
+    let pobj = mb.build().expect("build");
+    let dl = pobj.display_list_buffer().expect("dl");
+    assert_eq!(dl[3], 15, "vert 0 raw PNMTXIDX byte");
+    assert_eq!(dl[6], 33, "vert 1 raw PNMTXIDX byte");
+    assert_eq!(dl[9], 7, "vert 2 raw PNMTXIDX byte");
+}
+
+#[test]
+fn pos_mat_idx_count_mismatch_errors() {
+    // Validation: pos_mat_idx count must match positions count.
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.0, 0.0);
+    mb.add_position(0.0, 1.0, 0.0);
+    mb.add_triangle(0, 1, 2);
+    mb.add_pos_mat_idx(0);
+    mb.add_pos_mat_idx(0);
+    // missing 3rd
+    let err = mb.build().unwrap_err();
+    assert!(
+        err.to_string().contains("pos_mat_idx count != position count"),
+        "expected count mismatch error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn pos_mat_idx_and_envelopes_are_mutually_exclusive() {
+    // Validation: combining envelopes with pos_mat_idx is rejected.
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.0, 0.0);
+    mb.add_position(0.0, 1.0, 0.0);
+    mb.add_triangle(0, 1, 2);
+    let jobj = hsdraw_core::common::JObj::allocate_default();
+    mb.add_envelope(vec![(jobj, 1.0)]);
+    mb.add_envelope_index(0);
+    mb.add_envelope_index(0);
+    mb.add_envelope_index(0);
+    mb.set_use_pos_mat_idx(true);
+    mb.add_pos_mat_idx(0);
+    mb.add_pos_mat_idx(0);
+    mb.add_pos_mat_idx(0);
+    let err = mb.build().unwrap_err();
+    assert!(
+        err.to_string().contains("mutually exclusive"),
+        "expected mutual-exclusion error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn pobj_flags_setter_writes_arbitrary_u16() {
+    // Pin #1: PObj::set_flags writes the raw u16 verbatim, including
+    // bit patterns HSDLib's POBJ_FLAG enum doesn't model cleanly (e.g.
+    // 0x8000 = ENVELOPE on a POBJ that has no envelope-pointer array).
+    // Tests both the in-memory write and survival through writer
+    // round-trip.
+    use hsdraw_core::gx::PObjFlag;
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.0, 0.0);
+    mb.add_position(0.0, 1.0, 0.0);
+    mb.add_triangle(0, 1, 2);
+    let pobj = mb.build().expect("build");
+    pobj.set_flags(PObjFlag::from_bits_retain(0x8000)).expect("set_flags");
+    assert_eq!(pobj.flags().unwrap().bits(), 0x8000);
+
+    // Round-trip through writer + re-parse; flag must survive verbatim.
+    let dat = round_trip(dat_with_pobj(pobj));
+    let pobj2 = first_pobj(&dat);
+    assert_eq!(
+        pobj2.flags().unwrap().bits(),
+        0x8000,
+        "POBJ.flags=0x8000 must round-trip through writer + reader"
+    );
+}

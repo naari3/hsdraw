@@ -24,7 +24,8 @@
 //!   left over from parse is replaced.
 //!
 //! Special cases skipped here vs HSDLib:
-//!   - `_nextStruct` ordering hack for shape anims (not used by MKGP2)
+//!   - `_nextStruct` ordering hack for shape anims (not used by the
+//!     course-data path this writer was first validated against)
 //!   - SBM_FighterData / MEX_Data / kexData dedup suppression (n/a for
 //!     course .dat)
 //!   - `Roots[0]` typed as MEX/kex disabling `bufferAlign` (n/a)

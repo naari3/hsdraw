@@ -154,8 +154,8 @@ fn export_one_root(ex: &mut Exporter, root: &RootNode) -> Result<()> {
 
     // Heuristic: HSDRawFile.GuessAccessor uses suffix matching.  For Phase 4
     // we treat any root whose struct length is JObj-sized (>= 0x40) as an
-    // HSD_JOBJ — this matches the universe of MKGP2 *_joint roots and the
-    // csx "is HSD_JOBJ rj" branch.
+    // HSD_JOBJ — matches the csx "is HSD_JOBJ rj" branch on well-formed
+    // course corpora.
     if len < 0x40 {
         return Ok(());
     }

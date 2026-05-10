@@ -37,17 +37,19 @@ straight into Python without bringing project-specific schemas (e.g.
 | `DObj.set_pobj(p or None)`              | `d.Pobj = …`                                              | POBJ attach         |
 | `DObj.set_next(d or None)`              | `d.Next = …`                                              | DObj chain          |
 | `MeshBuilder()` + `.add_*` + `.build()` | `POBJ_Generator.CreatePOBJsFromTriangleList(…)`           | POBJ write          |
+| `MeshBuilder.from_arrays(positions=…, triangles=…, normals=…, colors=…, uvs=…)` | (= bulk `add_*`) | flat-array bulk push 経路 (per-vertex Python→Rust 遷移 cost を削る) |
 | `MeshBuilder.set_use_triangle_strips(b)` | `POBJ_Generator.UseTriangleStrips = b`                   | toggle Phase 2 opt  |
 | `MeshBuilder.add_envelope([(JObj, w)])` | `HSD_Envelope.Add(jobj, weight)`                          | Phase 3 skinning    |
 | `MeshBuilder.add_envelope_index(idx)`   | `GX_Vertex.PNMTXIDX`                                      | Phase 3 per-vertex bone slot |
-| `Pobj.flags` / `.display_list_size`     | `p.Flags` / `p.DisplayListSize`                           | POBJ inspection     |
+| `MeshBuilder.set_use_pos_mat_idx(b)` / `.add_pos_mat_idx(byte)` | (= DIRECT `GX_VA_PNMTXIDX` without `POBJ_FLAG.ENVELOPE`) | envelope-free per-vertex matrix index byte |
+| `Pobj.flags` (property; settable) / `.display_list_size` | `p.Flags` / `p.DisplayListSize` | POBJ inspection (setter で 0x8000 等の非標準 bit pattern を直接書ける) |
 | `Pobj.set_next(p or None)`              | `p.Next = …`                                              | POBJ chain          |
-| `MObj.alloc()` / `MObj.alloc_unlit_color(r,g,b,a)` | `new HSD_MOBJ()` / unlit preset                | material shell      |
+| `MObj.alloc()` / `MObj.alloc_unlit_color(r,g,b,a)` / `MObj.alloc_textured(material, image)` | `new HSD_MOBJ()` / unlit preset / lit-textured preset | material shell。`alloc_textured` は MObj + TObj + Image を 1 発で wire (render_flags=`CONSTANT|DIFFUSE|TEX0|ALPHA_MAT`、TObj に `LIGHTMAP_DIFFUSE` / `MODULATE` / `GX_TG_TEX0` 等を canned set) |
 | `MObj.set_material(m or None)`          | `m.Material = …`                                          | attach Material     |
 | `MObj.set_pe_desc(p or None)`           | `m.PEDesc = …`                                            | pixel-process desc  |
 | `MObj.set_textures(s or None)`          | `m.Textures = …`                                          | TObj chain attach   |
 | `MObj.render_flags` getter/setter       | `m.RenderFlags` (RENDER_MODE)                             | flag bits           |
-| `Material.alloc()` + `.{amb,dif,spc}_rgba` + `.alpha` + `.shininess` | `new HSD_Material { … }`              | material colors     |
+| `Material.alloc()` / `Material.new(amb=…, dif=…, spc=…, alpha=…, shininess=…)` + `.{amb,dif,spc}_rgba` + `.alpha` + `.shininess` | `new HSD_Material { … }` | material colors。`Material.new` は keyword-only named-arg ctor (default: amb=(0,0,0,0), dif=(255,255,255,255), spc=(255,255,255,255), alpha=1.0, shininess=50.0) |
 | `PeDesc.alloc()` + per-byte setters     | `new HSD_PEDesc { BlendMode=…, … }`                      | PE descriptor       |
 | `Dat.alloc_scene_data() -> Dat`         | `new HSDRawFile()` + manual SOBJ tree                     | from-scratch synthesis |
 | `SObj.alloc()` / `.from_struct(s)`      | `new HSD_SOBJ()` / `(HSD_SOBJ) s`                         | scene-object alloc / view |
@@ -395,6 +397,49 @@ print(tobj.to_dict())
 print(pobj.to_dict())   # raw flags, display_list_size, child presence
 print(mobj.to_dict())   # render_flags, material/textures/pe_desc presence
 print(jobj.to_dict())   # flags, child/next/dobj presence, TRS triples
+
+# (7) Pobj.flags writable property — overwrite for non-canonical bit
+#     patterns (e.g. 0x8000 on a statically-bound textured POBJ when
+#     the runtime expects that bit despite no envelope-pointer array).
+pobj.flags = 0x8000
+assert pobj.flags == 0x8000
+
+# (8) Envelope-free GX_VA_PNMTXIDX — per-vertex matrix-index byte in
+#     the DL bytecode without setting POBJ_FLAG.ENVELOPE.
+mb = hsdraw.MeshBuilder()
+mb.add_position(0, 0, 0); mb.add_position(1, 0, 0); mb.add_position(0, 1, 0)
+mb.add_triangle(0, 1, 2)
+mb.set_use_pos_mat_idx(True)
+for _ in range(3):
+    mb.add_pos_mat_idx(0)        # all verts on matrix slot 0
+pobj = mb.build()
+assert (pobj.flags & 0x8000) == 0   # ENVELOPE bit clear
+
+# (9) MObj.alloc_textured — 1-call MObj + TObj + Image wiring.
+mat = hsdraw.Material.new(amb=(0,0,0,255), dif=(192,128,64,255))
+img = hsdraw.Image.alloc()
+img.width = 64; img.height = 64; img.format = 6   # RGBA8
+img.set_image_data_bytes(gx_bytes)
+mobj = hsdraw.MObj.alloc_textured(mat, img)
+# render_flags = CONSTANT|DIFFUSE|TEX0|ALPHA_MAT; TObj has
+# LIGHTMAP_DIFFUSE on, GX_TG_TEX0, MODULATE color/alpha op,
+# scale=(1,1,1), wrap=REPEAT, mag=LINEAR, blending=1.0.
+
+# (10) MeshBuilder.from_arrays — flat-array bulk push (≥ 5x faster
+#      than per-vertex add_* loop on Python side).
+mb = hsdraw.MeshBuilder.from_arrays(
+    positions=[0,0,0, 1,0,0, 0,1,0, 1,1,0],
+    triangles=[0,1,2, 1,3,2],
+    normals=[0,0,1] * 4,
+    colors=bytes([255,0,0,255] * 4),
+    uvs=[0,0, 1,0, 0,1, 1,1],
+)
+pobj = mb.build()
+
+# (11) Material.new — named-arg ctor with sensible defaults
+#      (white dif/spc, alpha=1, shininess=50).  Skip kwargs you
+#      don't care about.
+mat = hsdraw.Material.new(dif=(192, 128, 64, 255))
 ```
 
 ## Limitations (deliberate non-goals)

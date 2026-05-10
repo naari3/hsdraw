@@ -26,7 +26,7 @@ use hsdraw_core::common::{
 use hsdraw_core::dat::RootNode;
 use hsdraw_core::gx::{
     AlphaMap, ColorMap, CoordType, GxAnisotropy, GxTexFilter, GxTexFmt, GxTexGenSrc, GxTexMapId,
-    GxTlutFmt, GxWrapMode, JObjFlag, MaterialRenderMode, TObjFlags,
+    GxTlutFmt, GxWrapMode, JObjFlag, MaterialRenderMode, PObjFlag, TObjFlags,
 };
 use hsdraw_core::hsd_struct::{StructRef, ptr_eq};
 use hsdraw_core::pobj_writer::MeshBuilder as CoreMeshBuilder;
@@ -139,7 +139,10 @@ impl PyDat {
         }))
     }
 
-    /// `scene_data` root if present (every MKGP2 course .dat has it).
+    /// The `scene_data` root if present — the conventional root name
+    /// for HSD-format scene files.  Returns `None` if the .dat has no
+    /// such root (e.g. a fighter / character file uses different
+    /// conventions).
     fn scene_data(&self) -> Option<PyRoot> {
         let dat = self.inner.borrow();
         dat.scene_data().map(|r| PyRoot {
@@ -714,11 +717,30 @@ impl PyPObj {
         s.set_reference(0x04, next.map(|n| n.inner.clone()));
     }
 
-    /// `POBJ_FLAG` bits as `u16`.  CULLBACK = (1<<14), CULLFRONT = (1<<15)
-    /// — the same bit positions HSDLib's `POBJ_FLAG` uses.
+    /// `POBJ_FLAG` bits as `u16`.  Bit positions match HSDLib's
+    /// `POBJ_FLAG`: ENVELOPE=0x8000, SHAPESET=0x4000, CULLBACK=0x2000,
+    /// CULLFRONT=0x1000.  Note that real-world game corpora sometimes
+    /// repurpose these bits — most commonly 0x8000 on statically-bound
+    /// textured POBJs without an actual envelope-pointer array — which
+    /// `MeshBuilder.build` won't emit on its own.  Use the setter
+    /// below when you need to overwrite the flag word to match a
+    /// specific bit pattern.
     #[getter]
     fn flags(&self) -> PyResult<u16> {
         self.inner.borrow().get_u16(0x0C).map_err(map_err)
+    }
+
+    /// Overwrite POBJ.flags (u16 at offset 0x0C).  Use when the flag
+    /// value you need doesn't fit HSDLib's canonical `POBJ_FLAG` enum
+    /// semantics (e.g. game-specific repurposing of `POBJ_TYPE_MASK` /
+    /// `ENVELOPE` bits).  Caller is responsible for keeping the 0x14
+    /// reference (envelope pointer array vs. SingleBoundJOBJ vs.
+    /// nothing) consistent with whatever bits they're setting.
+    #[setter]
+    fn set_flags(&self, bits: u16) -> PyResult<()> {
+        CorePObj::from_struct(self.inner.clone())
+            .set_flags(PObjFlag::from_bits_retain(bits))
+            .map_err(map_err)
     }
 
     /// DL bytecode size in bytes (computed: stored as `bytes/32`).
@@ -801,9 +823,38 @@ impl PyMObj {
     /// (r, g, b, a), alpha = 1.0, shininess = 50.0.  No textures, no
     /// PE descriptor.  Useful as the placeholder material for a
     /// brand-new mesh that doesn't have a real material yet.
+    ///
+    /// Caveat: some HSD-format consumers will not bind any TObj on a
+    /// MObj that lacks `LIGHTMAP_DIFFUSE` (a TObj-side flag), so this
+    /// preset isn't suitable for textured rendering even after a TObj
+    /// is later attached.  Use `MObj.alloc_textured(material, image)`
+    /// for the textured-render preset.
     #[staticmethod]
     fn alloc_unlit_color(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { inner: CoreMObj::allocate_unlit_color(r, g, b, a).0 }
+    }
+
+    /// "Textured lit" preset: one-call wiring of MObj + a fresh TObj
+    /// pointing at the supplied `material` and `image`.  Sets render
+    /// flags to `CONSTANT | DIFFUSE | TEX0 | ALPHA_MAT`, allocates a
+    /// TObj with the field values widely seen on textured POBJs in
+    /// vanilla HSD course corpora (TG_TEX0, MODULATE color/alpha op,
+    /// REPEAT wrap, LINEAR mag, blending=1.0, LIGHTMAP_DIFFUSE on),
+    /// and attaches the supplied Image.
+    ///
+    /// Caller responsibility:
+    ///   - Build the `Material` first (e.g. `Material.new(amb=..., dif=...)`).
+    ///   - Build the `Image` first: `Image.alloc()` → set `width` /
+    ///     `height` / `format` → `set_image_data_bytes(...)`.
+    ///   - Attach a `PeDesc` separately via `set_pe_desc(...)` if
+    ///     alpha-test / blend-mode tweaks are needed.
+    ///   - Attach a `Tlut` via `mobj.textures.set_tlut_data(...)` for
+    ///     paletted image formats (`CI4` / `CI8` / `CI14X2`).
+    #[staticmethod]
+    fn alloc_textured(material: &PyMaterial, image: &PyImage) -> Self {
+        let mat = CoreMaterial::from_struct(material.inner.clone());
+        let img = CoreImage::from_struct(image.inner.clone());
+        Self { inner: CoreMObj::allocate_textured(mat, img).0 }
     }
 
     #[staticmethod]
@@ -937,6 +988,43 @@ impl PyMaterial {
     #[staticmethod]
     fn alloc() -> Self {
         Self { inner: CoreMaterial::allocate_default().0 }
+    }
+
+    /// One-call constructor: allocate + set every field in one shot.
+    /// All arguments are keyword-only with sensible defaults so callers
+    /// can fill in just the fields they care about.  Equivalent to
+    /// `Material.alloc()` + 5 setter calls.
+    ///
+    /// - `amb` / `dif` / `spc`: RGBA8 4-tuples (`(r, g, b, a)` u8).
+    /// - `alpha`: f32 multiplier into every TEV stage's `RAS` source α
+    ///   (sensible range `[0.0, 1.0]`).
+    /// - `shininess`: f32 Phong-cosine exponent for the specular
+    ///   highlight (sensible range roughly `[1.0, 200.0]`; default 50).
+    #[staticmethod]
+    #[pyo3(signature = (
+        *,
+        amb = (0, 0, 0, 0),
+        dif = (0xFF, 0xFF, 0xFF, 0xFF),
+        spc = (0xFF, 0xFF, 0xFF, 0xFF),
+        alpha = 1.0,
+        shininess = 50.0,
+    ))]
+    fn new(
+        amb: (u8, u8, u8, u8),
+        dif: (u8, u8, u8, u8),
+        spc: (u8, u8, u8, u8),
+        alpha: f32,
+        shininess: f32,
+    ) -> PyResult<Self> {
+        let mat = CoreMaterial::allocate(
+            [amb.0, amb.1, amb.2, amb.3],
+            [dif.0, dif.1, dif.2, dif.3],
+            [spc.0, spc.1, spc.2, spc.3],
+            alpha,
+            shininess,
+        )
+        .map_err(map_err)?;
+        Ok(Self { inner: mat.0 })
     }
 
     #[staticmethod]
@@ -2076,6 +2164,111 @@ impl PyMeshBuilder {
         Self { inner: RefCell::new(CoreMeshBuilder::new()) }
     }
 
+    /// Bulk-load mesh data from flat per-component sequences in a
+    /// single PyO3 call.  Equivalent to a `MeshBuilder()` + N×
+    /// `add_position` / `add_normal` / `add_color` / `add_uv` /
+    /// `add_triangle` calls but saves the per-vertex Python→Rust
+    /// transition cost.
+    ///
+    /// Argument layout (all keyword-only, validated lengths):
+    ///   - `positions`: flat `[x0, y0, z0, x1, y1, z1, …]` float
+    ///     sequence.  Length must be a multiple of 3; the count of
+    ///     vertices is `len(positions) / 3`.
+    ///   - `triangles`: flat `[i0, i1, i2, i0, i1, i2, …]` int
+    ///     sequence.  Length must be a multiple of 3; each index
+    ///     must be in `[0, n_verts)`.
+    ///   - `normals` (optional): flat `[nx, ny, nz, …]` floats; must
+    ///     be `3 * n_verts` long when supplied.
+    ///   - `colors` (optional): flat `[r, g, b, a, …]` u8 sequence
+    ///     (or `bytes`); must be `4 * n_verts` long.
+    ///   - `uvs` (optional): flat `[u, v, …]` float sequence; must
+    ///     be `2 * n_verts` long.
+    ///
+    /// All length validation runs before any push, so on error the
+    /// returned builder is empty.  Per-vertex envelope rigging /
+    /// PNMTXIDX bytes are not part of this bulk path — call
+    /// `add_envelope` / `add_envelope_index` / `add_pos_mat_idx` on
+    /// the returned builder afterwards.
+    #[staticmethod]
+    #[pyo3(signature = (
+        *,
+        positions,
+        triangles,
+        normals = None,
+        colors = None,
+        uvs = None,
+    ))]
+    fn from_arrays(
+        positions: Vec<f32>,
+        triangles: Vec<u32>,
+        normals: Option<Vec<f32>>,
+        colors: Option<Vec<u8>>,
+        uvs: Option<Vec<f32>>,
+    ) -> PyResult<Self> {
+        if !positions.len().is_multiple_of(3) {
+            return Err(PyValueError::new_err(
+                "MeshBuilder.from_arrays: positions length must be divisible by 3 (got flat [x,y,z, …])",
+            ));
+        }
+        let n_verts = positions.len() / 3;
+        if !triangles.len().is_multiple_of(3) {
+            return Err(PyValueError::new_err(
+                "MeshBuilder.from_arrays: triangles length must be divisible by 3 (got flat [i,j,k, …])",
+            ));
+        }
+        if let Some(ref nrm) = normals {
+            if nrm.len() != n_verts * 3 {
+                return Err(PyValueError::new_err(format!(
+                    "MeshBuilder.from_arrays: normals length must be 3 * n_verts = {} (got {})",
+                    n_verts * 3,
+                    nrm.len()
+                )));
+            }
+        }
+        if let Some(ref clr) = colors {
+            if clr.len() != n_verts * 4 {
+                return Err(PyValueError::new_err(format!(
+                    "MeshBuilder.from_arrays: colors length must be 4 * n_verts = {} (got {})",
+                    n_verts * 4,
+                    clr.len()
+                )));
+            }
+        }
+        if let Some(ref uv) = uvs {
+            if uv.len() != n_verts * 2 {
+                return Err(PyValueError::new_err(format!(
+                    "MeshBuilder.from_arrays: uvs length must be 2 * n_verts = {} (got {})",
+                    n_verts * 2,
+                    uv.len()
+                )));
+            }
+        }
+
+        let mut mb = CoreMeshBuilder::new();
+        for c in positions.chunks_exact(3) {
+            mb.add_position(c[0], c[1], c[2]);
+        }
+        if let Some(nrm) = normals {
+            for c in nrm.chunks_exact(3) {
+                mb.add_normal(c[0], c[1], c[2]);
+            }
+        }
+        if let Some(clr) = colors {
+            for c in clr.chunks_exact(4) {
+                mb.add_color(c[0], c[1], c[2], c[3]);
+            }
+        }
+        if let Some(uv) = uvs {
+            for c in uv.chunks_exact(2) {
+                mb.add_uv(c[0], c[1]);
+            }
+        }
+        for c in triangles.chunks_exact(3) {
+            mb.add_triangle(c[0], c[1], c[2]);
+        }
+        Ok(Self { inner: RefCell::new(mb) })
+    }
+
     fn add_position(&self, x: f32, y: f32, z: f32) {
         self.inner.borrow_mut().add_position(x, y, z);
     }
@@ -2174,6 +2367,32 @@ impl PyMeshBuilder {
     /// the envelopes added via `add_envelope`.
     fn add_envelope_index(&self, env_idx: u32) {
         self.inner.borrow_mut().add_envelope_index(env_idx);
+    }
+
+    /// Toggle the no-envelope `GX_VA_PNMTXIDX` emission path (off by
+    /// default).  When `True`, the builder will emit a DIRECT 1-byte
+    /// `GX_VA_PNMTXIDX` attribute populated from per-vertex matrix
+    /// indices pushed via `add_pos_mat_idx`, **without** setting
+    /// `POBJ_FLAG.ENVELOPE` (= no envelope-pointer array attached at
+    /// POBJ + 0x14).  Use this when your runtime expects every vertex
+    /// to carry a matrix-index byte regardless of whether the mesh is
+    /// skinned — the `Pobj.flags` u16 stays whatever you set on it
+    /// separately (see `Pobj.flags` setter).
+    ///
+    /// Mutually exclusive with `add_envelope`: `build()` rejects the
+    /// combination.  Toggling off (`False`) clears any indices already
+    /// pushed via `add_pos_mat_idx`.
+    fn set_use_pos_mat_idx(&self, on: bool) {
+        self.inner.borrow_mut().set_use_pos_mat_idx(on);
+    }
+
+    /// Push one `GX_VA_PNMTXIDX` byte for the next vertex.  Implicitly
+    /// activates the no-envelope PNMTXIDX path (= as if
+    /// `set_use_pos_mat_idx(True)` had been called first).  When the
+    /// path is active, the count of pushed indices must equal
+    /// `positions` count at `build()` time.
+    fn add_pos_mat_idx(&self, idx: u8) {
+        self.inner.borrow_mut().add_pos_mat_idx(idx);
     }
 
     fn envelope_count(&self) -> usize {

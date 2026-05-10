@@ -121,6 +121,98 @@ fn unlit_color_preset_round_trips() {
     assert!((mat2.shininess().unwrap() - 50.0).abs() < 1e-6);
 }
 
+#[test]
+fn textured_preset_round_trips() {
+    // Pin #5: MObj::allocate_textured produces a fully-wired
+    // (MObj + Material + TObj + Image) chain whose field values
+    // survive writer round-trip.  Verifies:
+    //   - render_flags has CONSTANT | DIFFUSE | TEX0 | ALPHA_MAT
+    //   - Material is the one we passed in (round-trip preserves
+    //     its diffuse RGBA)
+    //   - TObj has tex_gen_src=GX_TG_TEX0, scale=(1,1,1),
+    //     mag=GX_LINEAR, color/alpha op=MODULATE,
+    //     LIGHTMAP_DIFFUSE on, wrap=REPEAT/REPEAT
+    //   - Image is attached and its bytes / format / dims survive
+    let mat = hsdraw_core::common::Material::allocate(
+        [0x10, 0x10, 0x10, 0xFF], // amb
+        [0xC0, 0x80, 0x40, 0xFF], // dif
+        [0xFF, 0xFF, 0xFF, 0xFF], // spc
+        1.0,
+        50.0,
+    )
+    .unwrap();
+    let img = Image::allocate_default();
+    img.set_width(4).unwrap();
+    img.set_height(4).unwrap();
+    img.set_format(GxTexFmt::RGB565).unwrap();
+    img.set_image_data_bytes(vec![0u8; 32]);
+
+    let mobj = MObj::allocate_textured(mat, img);
+
+    // Pre-write checks.
+    let flags = mobj.render_flags().unwrap();
+    for bit in [
+        MaterialRenderMode::CONSTANT,
+        MaterialRenderMode::DIFFUSE,
+        MaterialRenderMode::TEX0,
+        MaterialRenderMode::ALPHA_MAT,
+    ] {
+        assert!(flags.intersects(bit), "render_flags missing required bit");
+    }
+    let tobj = mobj.textures().expect("TObj attached");
+    assert_eq!(tobj.tex_gen_src().unwrap(), GxTexGenSrc::GX_TG_TEX0);
+    assert_eq!(tobj.sx().unwrap(), 1.0);
+    assert_eq!(tobj.mag_filter().unwrap(), GxTexFilter::GX_LINEAR);
+    assert_eq!(tobj.color_operation().unwrap(), ColorMap::MODULATE);
+    assert_eq!(tobj.alpha_operation().unwrap(), AlphaMap::MODULATE);
+    assert!(tobj.is_lightmap_diffuse().unwrap());
+    assert_eq!(tobj.wrap_s().unwrap(), GxWrapMode::REPEAT);
+    assert_eq!(tobj.wrap_t().unwrap(), GxWrapMode::REPEAT);
+    assert!(tobj.image_data().is_some());
+
+    // Round-trip.
+    let dat = round_trip(dat_with_mobj(mobj));
+    let mobj2 = extract_first_mobj(&dat);
+    let flags2 = mobj2.render_flags().unwrap();
+    for bit in [
+        MaterialRenderMode::CONSTANT,
+        MaterialRenderMode::DIFFUSE,
+        MaterialRenderMode::TEX0,
+        MaterialRenderMode::ALPHA_MAT,
+    ] {
+        assert!(flags2.intersects(bit), "render_flags lost a bit through round-trip");
+    }
+    let tobj2 = mobj2.textures().expect("TObj survives round-trip");
+    assert_eq!(tobj2.tex_gen_src().unwrap(), GxTexGenSrc::GX_TG_TEX0);
+    assert!(tobj2.is_lightmap_diffuse().unwrap());
+    let img2 = tobj2.image_data().expect("Image survives round-trip");
+    assert_eq!(img2.width().unwrap(), 4);
+    assert_eq!(img2.height().unwrap(), 4);
+    assert_eq!(img2.format().unwrap(), GxTexFmt::RGB565);
+
+    let mat2 = mobj2.material().expect("Material survives round-trip");
+    assert_eq!(mat2.dif_rgba().unwrap(), [0xC0, 0x80, 0x40, 0xFF]);
+}
+
+#[test]
+fn material_allocate_named_args_round_trips() {
+    // Pin #10: Material::allocate writes every field via the named-
+    // argument constructor and the round-trip preserves them.
+    let mat = hsdraw_core::common::Material::allocate(
+        [0x11, 0x22, 0x33, 0xFF],
+        [0x44, 0x55, 0x66, 0xFF],
+        [0x77, 0x88, 0x99, 0xFF],
+        0.75,
+        128.0,
+    )
+    .unwrap();
+    assert_eq!(mat.amb_rgba().unwrap(), [0x11, 0x22, 0x33, 0xFF]);
+    assert_eq!(mat.dif_rgba().unwrap(), [0x44, 0x55, 0x66, 0xFF]);
+    assert_eq!(mat.spc_rgba().unwrap(), [0x77, 0x88, 0x99, 0xFF]);
+    assert!((mat.alpha().unwrap() - 0.75).abs() < 1e-6);
+    assert!((mat.shininess().unwrap() - 128.0).abs() < 1e-6);
+}
+
 // =====================================================================
 // TObj / Image allocator + setters
 // =====================================================================

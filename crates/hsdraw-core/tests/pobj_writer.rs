@@ -22,7 +22,7 @@ use hsdraw_core::dat::{Dat, RootNode};
 use hsdraw_core::gx::{GxAttribName, GxAttribType, GxPrimitiveType, PObjFlag};
 use hsdraw_core::gx_dl;
 use hsdraw_core::hsd_struct::HsdStruct;
-use hsdraw_core::pobj_writer::MeshBuilder;
+use hsdraw_core::pobj_writer::{ColorFormat, MeshBuilder, NormalFormat, PosFormat, UvFormat};
 
 /// Build a minimal `Dat` with a `scene_data` root pointing at a single
 /// JObj that owns one DObj that owns the given POBJ.  The SObj /
@@ -799,5 +799,86 @@ fn pobj_flags_setter_writes_arbitrary_u16() {
         pobj2.flags().unwrap().bits(),
         0x8000,
         "POBJ.flags=0x8000 must round-trip through writer + reader"
+    );
+}
+
+// =====================================================================
+// Attribute format builder (Phase 7) — API back-compat gate.
+//
+// The format setters (`set_pos_format` / `set_normal_format` /
+// `set_color_format` / `set_uv_format`) accept enums whose default
+// variants reproduce the pre-Phase-7 hard-coded behavior (`F32×3` /
+// `RGBA8` / `F32×2`).  Calling each setter with its default value must
+// produce a byte-identical DAT to the no-setter path.  Non-default
+// variants (S16x3 / S8x3 / Rgb565 / Rgba4 / S16x2 / S8x2) are reserved
+// placeholders that `build()` rejects until the per-format encoders
+// land (todo.md §2.7).
+// =====================================================================
+
+#[test]
+fn format_setters_with_defaults_match_no_setter_path() {
+    // No-setter baseline: a tiny POS-only triangle.
+    let mut mb0 = MeshBuilder::new();
+    mb0.add_position(0.0, 0.0, 0.0);
+    mb0.add_position(1.0, 0.0, 0.0);
+    mb0.add_position(0.0, 1.0, 0.0);
+    mb0.add_triangle(0, 1, 2);
+    let pobj0 = mb0.build().expect("build baseline");
+    let bytes0 = dat_with_pobj(pobj0).write().expect("write baseline");
+
+    // With every setter called explicitly with the default enum
+    // variant.  Output must match baseline exactly.
+    let mut mb1 = MeshBuilder::new();
+    mb1.add_position(0.0, 0.0, 0.0);
+    mb1.add_position(1.0, 0.0, 0.0);
+    mb1.add_position(0.0, 1.0, 0.0);
+    mb1.add_triangle(0, 1, 2);
+    mb1.set_pos_format(PosFormat::F32x3);
+    mb1.set_normal_format(NormalFormat::F32x3);
+    mb1.set_color_format(ColorFormat::Rgba8);
+    mb1.set_uv_format(UvFormat::F32x2);
+    let pobj1 = mb1.build().expect("build with default setters");
+    let bytes1 = dat_with_pobj(pobj1).write().expect("write with setters");
+
+    assert_eq!(
+        bytes0, bytes1,
+        "default-format setters must produce byte-identical output"
+    );
+}
+
+#[test]
+fn pos_format_s16x3_is_rejected_until_implemented() {
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.0, 0.0);
+    mb.add_position(0.0, 1.0, 0.0);
+    mb.add_triangle(0, 1, 2);
+    mb.set_pos_format(PosFormat::S16x3 { exponent: 8 });
+    let err = mb.build().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("S16x3") && msg.contains("not yet implemented"),
+        "expected unsupported-format error mentioning S16x3, got: {}",
+        msg
+    );
+}
+
+#[test]
+fn color_format_rgb565_is_rejected_until_implemented() {
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.0, 0.0);
+    mb.add_position(0.0, 1.0, 0.0);
+    mb.add_color(0xFF, 0x00, 0x00, 0xFF);
+    mb.add_color(0x00, 0xFF, 0x00, 0xFF);
+    mb.add_color(0x00, 0x00, 0xFF, 0xFF);
+    mb.add_triangle(0, 1, 2);
+    mb.set_color_format(ColorFormat::Rgb565);
+    let err = mb.build().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Rgb565") && msg.contains("not yet implemented"),
+        "expected unsupported-format error mentioning Rgb565, got: {}",
+        msg
     );
 }

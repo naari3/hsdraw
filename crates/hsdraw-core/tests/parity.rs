@@ -1,11 +1,26 @@
-//! Parity test harness.  Drives both csx (`mkgp2-patch/tools/hsd/
-//! hsd_export_for_blender.csx`) and the Rust exporter on the same .dat,
-//! then diffs `scene.json` semantically and `tex/*.png` for pixel-level
-//! equality.  Set `MKGP2_PATCH_DIR` (= the mkgp2-patch repo root) and
-//! `MKGP2_FILES_DIR` (= the directory holding vanilla .dat files) to enable
-//! the `#[ignore]`d corpus tests.
+//! Parity test harness.  Drives both csx (a `dotnet-script` exporter, see
+//! `docs/notes/csx_export_parity.md`) and the Rust exporter on the same
+//! .dat, then diffs `scene.json` semantically and `tex/*.png` for
+//! pixel-level equality.
 //!
-//! Without those env vars, the harness still runs the Rust-only smoke test
+//! Env-var contract (generic — not tied to any specific game corpus):
+//!
+//! - `HSDRAW_PARITY_CORPUS_DIR` — directory holding the `.dat` files to
+//!   round-trip (all top-level `*.dat` entries get exercised unless
+//!   `HSDRAW_PARITY_FILES` restricts to a comma-separated subset).
+//! - `HSDRAW_PARITY_CSX_FILE` — path to the csx exporter to drive via
+//!   `dotnet-script`.  Required for the csx-driven `vanilla_corpus_round_trips`
+//!   gate; writer round-trip works without it.
+//! - `HSDRAW_PARITY_FILES` (optional) — comma-separated list of `.dat`
+//!   base names inside `HSDRAW_PARITY_CORPUS_DIR` to limit the gate to.
+//!
+//! Back-compat: the older `MKGP2_FILES_DIR` / `MKGP2_PATCH_DIR` env vars are
+//! still recognized.  `MKGP2_PATCH_DIR` is treated as a patch-repo root whose
+//! `tools/hsd/hsd_export_for_blender.csx` is the csx file (= the historical
+//! mkgp2-patch layout).  These will be dropped in a future release; new
+//! callers should set the `HSDRAW_PARITY_*` names.
+//!
+//! Without any of these, the harness still runs the Rust-only smoke test
 //! against the synthetic fixture in `tests/data/`.  csx-driven comparisons
 //! are skipped via `eprintln!("skipped"); return;` per
 //! `docs/handoff.md` § "csx parity tests".
@@ -36,12 +51,60 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root")
 }
 
-fn mkgp2_patch_dir() -> Option<PathBuf> {
-    std::env::var_os("MKGP2_PATCH_DIR").map(PathBuf::from)
+/// Resolve the corpus directory (a directory holding `.dat` files).
+///
+/// Preferred env var is `HSDRAW_PARITY_CORPUS_DIR`; the older
+/// `MKGP2_FILES_DIR` is recognized as a back-compat alias.
+fn corpus_dir() -> Option<PathBuf> {
+    std::env::var_os("HSDRAW_PARITY_CORPUS_DIR")
+        .or_else(|| std::env::var_os("MKGP2_FILES_DIR"))
+        .map(PathBuf::from)
 }
 
-fn mkgp2_files_dir() -> Option<PathBuf> {
-    std::env::var_os("MKGP2_FILES_DIR").map(PathBuf::from)
+/// Resolve the csx exporter file to drive via `dotnet-script`.
+///
+/// Preferred env var is `HSDRAW_PARITY_CSX_FILE` (path to the .csx
+/// directly).  As a back-compat path, `MKGP2_PATCH_DIR` is treated as a
+/// patch-repo root whose `tools/hsd/hsd_export_for_blender.csx` is the
+/// csx file.  Returns `None` if neither is set.
+fn csx_file() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("HSDRAW_PARITY_CSX_FILE") {
+        return Some(PathBuf::from(p));
+    }
+    if let Some(patch) = std::env::var_os("MKGP2_PATCH_DIR") {
+        return Some(
+            PathBuf::from(patch)
+                .join("tools")
+                .join("hsd")
+                .join("hsd_export_for_blender.csx"),
+        );
+    }
+    None
+}
+
+/// Enumerate the `.dat` files under `dir`.  If `HSDRAW_PARITY_FILES` is
+/// set, restrict to that comma-separated subset (basename match);
+/// otherwise return every top-level `*.dat` file in deterministic
+/// (sorted) order.
+fn corpus_files(dir: &Path) -> Vec<PathBuf> {
+    if let Ok(names) = std::env::var("HSDRAW_PARITY_FILES") {
+        return names
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|name| dir.join(name))
+            .collect();
+    }
+    let mut out: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(it) => it
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "dat"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    out.sort();
+    out
 }
 
 fn dotnet_script_available() -> bool {
@@ -53,12 +116,8 @@ fn dotnet_script_available() -> bool {
 }
 
 fn run_csx(dat: &Path, out_dir: &Path) -> Result<(), String> {
-    let patch = mkgp2_patch_dir()
-        .ok_or_else(|| "MKGP2_PATCH_DIR not set".to_owned())?;
-    let csx = patch
-        .join("tools")
-        .join("hsd")
-        .join("hsd_export_for_blender.csx");
+    let csx = csx_file()
+        .ok_or_else(|| "HSDRAW_PARITY_CSX_FILE (or MKGP2_PATCH_DIR) not set".to_owned())?;
     if !csx.exists() {
         return Err(format!("csx not found at {}", csx.display()));
     }
@@ -370,12 +429,12 @@ fn rust_export_runs_on_synthetic() {
 
 #[test]
 fn vanilla_corpus_round_trips() {
-    if mkgp2_files_dir().is_none() {
-        eprintln!("skipped: MKGP2_FILES_DIR not set");
+    let Some(files_dir) = corpus_dir() else {
+        eprintln!("skipped: HSDRAW_PARITY_CORPUS_DIR not set");
         return;
-    }
-    if mkgp2_patch_dir().is_none() {
-        eprintln!("skipped: MKGP2_PATCH_DIR not set");
+    };
+    if csx_file().is_none() {
+        eprintln!("skipped: HSDRAW_PARITY_CSX_FILE not set");
         return;
     }
     if !dotnet_script_available() {
@@ -383,28 +442,26 @@ fn vanilla_corpus_round_trips() {
         return;
     }
 
-    let files_dir = mkgp2_files_dir().unwrap();
-    // The handoff prescribes "MR_highway 短/長, mc_jungle, mc_kingdom,
-    // mc_palace, st_pyramid (6 コース)". The MKGP2 vanilla files actually
-    // ship under different prefixes (AT_/DK_/DNA_/MR_/…), so we pick six
-    // real course .dat files that exercise the full breadth of texture
-    // formats (CMP/RGBA8/RGB5A3/CI8/IA8) and PObj layouts.
-    let target_files = [
-        "test_course_start_gate.dat", // synthetic-ish smoke test
-        "MR_highway_short_A.dat",
-        "MR_highway_long_A.dat",
-        "DK_jungle_short_a.dat",
-        "DK_jungle_long_a.dat",
-        "AT_demo.dat",
-    ];
+    let target_files = corpus_files(&files_dir);
+    if target_files.is_empty() {
+        eprintln!(
+            "skipped: no .dat files under {} (set HSDRAW_PARITY_FILES to restrict)",
+            files_dir.display()
+        );
+        return;
+    }
 
-    for name in target_files {
-        let dat = files_dir.join(name);
+    for dat in target_files {
+        let name = dat
+            .file_name()
+            .expect("file_name on corpus entry")
+            .to_string_lossy()
+            .into_owned();
         if !dat.exists() {
             eprintln!("  [skip] {} not present", name);
             continue;
         }
-        let stage = workspace_root().join("target").join("parity").join(name);
+        let stage = workspace_root().join("target").join("parity").join(&name);
         let _ = std::fs::remove_dir_all(&stage);
         let csx_dir = stage.join("csx");
         let rust_dir = stage.join("rust");
@@ -442,45 +499,48 @@ fn vanilla_corpus_round_trips() {
 /// `scene.json` matches the original's exactly.  Bytes don't have to match;
 /// HSDLib's own Save isn't byte-deterministic across reloc orderings either.
 ///
-/// The `*_set.dat` rosters carry the alias-root pattern described in
-/// `mkgp2docs/hsd_alias_and_blender_pipeline.md` — multiple root symbols
-/// that resolve to JObj structs already living inside the SOBJ tree.  We
-/// verify alias topology survives a write-out: every (root_j, sub_struct)
-/// identity match in the original is still observable after the round trip.
+/// Corpora containing alias-root rich fixtures (e.g. the `*_set.dat` HSD
+/// fighter / character bundles, see
+/// `mkgp2docs/hsd_alias_and_blender_pipeline.md`) exercise the multi-root
+/// identity-preservation path: multiple root symbols that resolve to
+/// JObj structs already living inside another root's SOBJ tree.  We
+/// verify alias topology survives a write-out: every (root_j,
+/// sub_struct) identity match in the original is still observable after
+/// the round trip.  Any `.dat` placed under `HSDRAW_PARITY_CORPUS_DIR`
+/// gets the same gate — alias-rich or not.
 #[test]
 fn vanilla_corpus_writer_round_trips() {
-    if mkgp2_files_dir().is_none() {
-        eprintln!("skipped: MKGP2_FILES_DIR not set");
+    let Some(files_dir) = corpus_dir() else {
+        eprintln!("skipped: HSDRAW_PARITY_CORPUS_DIR not set");
+        return;
+    };
+    let target_files = corpus_files(&files_dir);
+    if target_files.is_empty() {
+        eprintln!(
+            "skipped: no .dat files under {} (set HSDRAW_PARITY_FILES to restrict)",
+            files_dir.display()
+        );
         return;
     }
-    let files_dir = mkgp2_files_dir().unwrap();
-    let target_files = [
-        "test_course_start_gate.dat",
-        "MR_highway_short_A.dat",
-        "MR_highway_long_A.dat",
-        "DK_jungle_short_a.dat",
-        "DK_jungle_long_a.dat",
-        "AT_demo.dat",
-        // alias-root rich fixtures (12+ alias roots each)
-        "waluigi_set.dat",
-        "yoshi_set.dat",
-        "wario_set.dat",
-    ];
 
-    for name in target_files {
-        let dat_path = files_dir.join(name);
+    for dat_path in target_files {
+        let name = dat_path
+            .file_name()
+            .expect("file_name on corpus entry")
+            .to_string_lossy()
+            .into_owned();
         if !dat_path.exists() {
             eprintln!("  [skip] {} not present", name);
             continue;
         }
         let bytes = std::fs::read(&dat_path).expect("read original");
         let dat0 = Dat::parse(&bytes).expect("parse 1");
-        let scene0 = export::export_scene(&dat0, name, None).expect("export 1");
+        let scene0 = export::export_scene(&dat0, &name, None).expect("export 1");
         let alias0 = alias_topology(&dat0);
         let written = dat0.write().expect("write");
 
         let dat1 = Dat::parse(&written).expect("parse 2 (written file)");
-        let scene1 = export::export_scene(&dat1, name, None).expect("export 2");
+        let scene1 = export::export_scene(&dat1, &name, None).expect("export 2");
         let alias1 = alias_topology(&dat1);
 
         let v0: Value = serde_json::to_value(&scene0).expect("scene0 → json");

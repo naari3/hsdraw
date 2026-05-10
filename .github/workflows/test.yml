@@ -19,10 +19,11 @@ jobs:
       fail-fast: false
       matrix:
         # Phase 4 / handoff completion-criterion: parity gate green on all
-        # three OS.  We don't bring the MKGP2 corpus into CI (it's not
-        # redistributable), so `vanilla_corpus_*` skips itself via the
-        # MKGP2_FILES_DIR env-var check.  The synthetic fixture covers
-        # both reader and writer in their canonical form.
+        # three OS.  We don't bring any specific external HSD corpus into
+        # CI (= consumer choice; corpora aren't necessarily redistributable),
+        # so `vanilla_corpus_*` skips itself via the
+        # HSDRAW_PARITY_CORPUS_DIR env-var check.  The synthetic fixture
+        # covers both reader and writer in their canonical form.
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
@@ -80,8 +81,8 @@ jobs:
       - name: from-scratch chain smoke
         shell: bash
         working-directory: crates/hsdraw-py
-        # Exercises the full Dat.alloc_scene_data → JObj → DObj → MObj →
-        # Material → TObj → Image → 4x4 RGBA8 (gx_encode → RGB565) chain
+        # Exercises the full Dat.alloc_scene_data_minimal → JObj → DObj →
+        # MObj → Material → TObj → Image → 4x4 RGBA8 (gx_encode → RGB565) chain
         # at the PyO3 layer.  Mirrors tests/from_scratch.rs in the core
         # crate so any divergence between the Rust and Python surfaces
         # surfaces here.

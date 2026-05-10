@@ -9,7 +9,7 @@
 //! delta on the rebuilt tree.
 //!
 //! The full corpus tests live in `tests/parity.rs`; this file is the
-//! self-contained CI gate (no `MKGP2_FILES_DIR` env required).
+//! self-contained CI gate (no `HSDRAW_PARITY_CORPUS_DIR` env required).
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -413,7 +413,7 @@ fn primitive_set_reference_deep_field_repoint_round_trips() {
 
 #[test]
 fn alloc_scene_data_factory_matches_manual_synthesis() {
-    let dat = Dat::alloc_scene_data();
+    let dat = Dat::alloc_scene_data_minimal("scene_data");
 
     // Single scene_data root.
     assert_eq!(dat.roots.len(), 1);

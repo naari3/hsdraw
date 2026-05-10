@@ -495,12 +495,13 @@ pub fn palette_to_rgba(format: GxTlutFmt, data: &[u8]) -> Vec<u8> {
 
 // =====================================================================
 // GX texture encoders.  Inverse of the per-format decoders above.
-// Tlut / paletted formats (CI4 / CI8 / CI14X2) are intentionally NOT
-// encoded — the test corpus we calibrated against shows zero hits for
-// those across thousands of textures, and adding palette quantization
-// (median-cut + nearest-color) is mechanical when a use case arrives.
-// Callers that need a paletted source can route through RGB5A3 /
-// RGB565 instead.
+// Tlut / paletted formats (CI4 / CI8 / CI14X2 / I4 / I8 / IA4 / IA8)
+// are intentionally NOT encoded yet — palette quantization
+// (median-cut + nearest-color) plus per-format tile pack is mechanical
+// but non-trivial and has not been a priority for the consumers that
+// drove this library so far.  See `todo.md` §2.8 for the roadmap.
+// Until then, callers with paletted source data have to route through
+// one of the supported unpaletted formats (RGB5A3 / RGB565 / RGBA8).
 // =====================================================================
 
 /// Per-format encode tweaks.  Default state (`EncodeOptions::default()`)
@@ -575,11 +576,16 @@ pub fn encode_image_with_options(
         | GxTexFmt::IA8
         | GxTexFmt::CI4
         | GxTexFmt::CI8
-        | GxTexFmt::CI14X2
-        | GxTexFmt::Unknown(_) => {
+        | GxTexFmt::CI14X2 => {
             return Err(HsdError::malformed(
                 0,
-                "encode_image: only RGBA8 / RGB565 / RGB5A3 / CMP are supported",
+                "encode_image: paletted / intensity formats (I4 / I8 / IA4 / IA8 / CI4 / CI8 / CI14X2) are not yet encodable — see todo.md §2.8 for the roadmap; for now route paletted sources through one of the supported unpaletted formats (RGBA8 / RGB565 / RGB5A3 / CMP)",
+            ));
+        }
+        GxTexFmt::Unknown(_) => {
+            return Err(HsdError::malformed(
+                0,
+                "encode_image: unknown texture format",
             ));
         }
     })

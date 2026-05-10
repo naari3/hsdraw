@@ -16,7 +16,7 @@ side mesh data, and serialize back — all without depending on
 | **Writer** | HSDLib `Save`-compatible: struct identity dedup, FNV-1a buffer hash dedup, ref-chain key=0 skip, alias-root round-trip across the 9-file corpus |
 | **csx parity** | semantic JSON diff (ε = 1e-5) + PNG pixel-equal across 6 vanilla MKGP2 courses (`test_course_start_gate`, `MR_highway_short_A` & `_long_A`, `DK_jungle_short_a` & `_long_a`, `AT_demo`) |
 | **Mutation API** | HSDLib-equivalent allocation + setter primitives — see [details below](#mutation-primitives) |
-| **From-scratch synthesis** | `Dat::alloc_scene_data` factory + TObj / Image allocators + `gx_image::encode_image` (RGBA8 / RGB565 / RGB5A3 / CMP) — produce a self-contained .dat with no base file |
+| **From-scratch synthesis** | `Dat::alloc_scene_data_minimal(root_name)` factory + TObj / Image allocators + `gx_image::encode_image` (RGBA8 / RGB565 / RGB5A3 / CMP) — produce a self-contained .dat with no base file |
 | **POBJ writer** | `MeshBuilder` (positions / normals / colors / UVs / triangles / envelopes) → `Pobj`; greedy `TRIANGLE_STRIP` decomposition (toggleable, on by default), envelope rigging |
 | **PyO3** | abi3-py37 wheel covers Python 3.7+; identity-aware `__eq__` / `__hash__` on every typed view |
 | **CI** | `cargo test` on Linux / macOS / Windows + 5-platform abi3 wheel matrix via maturin |
@@ -24,14 +24,21 @@ side mesh data, and serialize back — all without depending on
 Test totals: **87 passing** env-free (20 unit + 12 mutation primitive +
 4 parity + 20 POBJ writer round-trip + 16 MObj / Material / PeDesc /
 TObj / Image / Lod round-trip + 13 GX texture encoder + 2 from-scratch
-chain).  With `MKGP2_FILES_DIR` + `MKGP2_PATCH_DIR` set, an additional
-6 csx-parity courses + 9-file writer round-trip corpus run.
+chain).  With `HSDRAW_PARITY_CORPUS_DIR` set (= a directory of `.dat`
+files; optionally narrowed with `HSDRAW_PARITY_FILES=comma,separated,
+names.dat`), `vanilla_corpus_writer_round_trips` exercises every `.dat`
+in that dir against the writer.  Additionally set
+`HSDRAW_PARITY_CSX_FILE` (= path to a `dotnet-script` csx exporter, see
+`docs/notes/csx_export_parity.md`) to also gate the read-side csx
+parity (`vanilla_corpus_round_trips`).  Older `MKGP2_FILES_DIR` /
+`MKGP2_PATCH_DIR` names remain back-compat aliases for now and will be
+dropped in a future release.
 
 ### Mutation primitives
 
 | Class | Methods |
 |---|---|
-| `Dat` | `add_root`, `remove_root`, `rename_root`, `repoint_root`, `find_root_for`, `scene_data`, `alloc_scene_data`, `write` |
+| `Dat` | `add_root`, `remove_root`, `rename_root`, `repoint_root`, `find_root_for`, `scene_data`, `alloc_scene_data_minimal(root_name)`, `write` |
 | `JObj` | `alloc`, `set_child`, `set_next`, `set_dobj`, `flags`, `tx … sz`, `local_trs` / `set_local_trs` |
 | `DObj` | `alloc`, `set_mobj`, `set_pobj`, `set_next` |
 | `MObj` | `alloc`, `alloc_unlit_color`, `alloc_textured(material, image)` (lit-textured preset), `set_material`, `set_textures`, `set_pe_desc`, `render_flags` |
@@ -212,13 +219,13 @@ underlying struct) works the same way HSDLib's reference equality does.
   smaller DL bytecode than the bare `Triangles` path, but HSDLib's full
   `TriangleConverter` (cache simulation + priority heap) is tighter on
   large meshes.
-- **Not a paletted-format encoder**.  RGBA8 / RGB565 / RGB5A3 / CMP
-  encoding is in (CMP via `texpresso` BC1 with the GX-specific BE word
-  swap + 8x8 super-block swizzle).  CI4 / CI8 / CI14X2 / I4 / I8 /
-  IA4 / IA8 stay read-only — vanilla MKGP2 corpus has zero hits across
-  7,812 textures so the addon can route paletted sources through
-  RGB5A3 / RGB565 instead.  Adding palette quantization is mechanical
-  when a use case lands.
+- **Not a paletted-format encoder (yet)**.  RGBA8 / RGB565 / RGB5A3 /
+  CMP encoding is in (CMP via `texpresso` BC1 with the GX-specific BE
+  word swap + 8x8 super-block swizzle).  CI4 / CI8 / CI14X2 / I4 / I8
+  / IA4 / IA8 stay read-only for now — palette quantization +
+  per-format tile pack are on the roadmap (see [`todo.md`](todo.md)
+  §2.8).  Until then, callers with paletted source data have to route
+  through one of the supported unpaletted formats.
 - **Not an in-place vanilla-POBJ editor**.  Mesh edits go through the
   "decompose via reader → `MeshBuilder` rebuild → splice" flow, not by
   mutating the original DL bytecode.

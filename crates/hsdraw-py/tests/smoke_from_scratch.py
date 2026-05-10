@@ -1,9 +1,9 @@
 """End-to-end Python smoke for the from-scratch synthesis pipeline.
 
 Mirrors ``crates/hsdraw-core/tests/from_scratch.rs`` at the PyO3 layer:
-``Dat.alloc_scene_data`` → root JObj → DObj → MObj → Material → TObj →
-Image (with ``gx_encode``-produced RGBA8 payload) → write → re-parse →
-walk and assert each link is intact.
+``Dat.alloc_scene_data_minimal`` → root JObj → DObj → MObj → Material →
+TObj → Image (with ``gx_encode``-produced RGBA8 payload) → write →
+re-parse → walk and assert each link is intact.
 
 Run via the CI ``maturin develop smoke`` job after the wheel installs;
 no pytest dependency, just plain ``python tests/smoke_from_scratch.py``.
@@ -21,7 +21,7 @@ def main() -> None:
     assert callable(hsdraw.gx_encode)
 
     # ---- Phase 1: scaffold ---------------------------------------
-    dat = hsdraw.Dat.alloc_scene_data()
+    dat = hsdraw.Dat.alloc_scene_data_minimal()
     assert dat.root_names() == ["scene_data"]
 
     sobj = hsdraw.SObj.from_struct(dat.scene_data().data)

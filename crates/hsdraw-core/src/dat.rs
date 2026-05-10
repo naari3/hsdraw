@@ -117,18 +117,30 @@ impl Dat {
     // with no base file to start from.
     // ------------------------------------------------------------------
 
-    /// Allocate an empty `Dat` with a `scene_data` root holding a fresh
-    /// SObj → JOBJDescs[] (1 slot) → JObjDesc → root JObj chain.  All
-    /// allocated structs are placeholders — the JObj has identity scale
-    /// and zero TRS, and no DObjs yet.  Caller chains further structural
-    /// edits (joint hierarchy, DObjs, …) onto the returned root joint.
+    /// Allocate an empty `Dat` with a single named root holding a
+    /// **minimal** SObj → JOBJDescs[] (1 slot) → JObjDesc → root JObj
+    /// chain.  All allocated structs are placeholders — the JObj has
+    /// identity scale and zero TRS, and no DObjs yet.  Caller chains
+    /// further structural edits (joint hierarchy, DObjs, …) onto the
+    /// returned root joint.
     ///
-    /// Use `dat.scene_data().unwrap().data` to grab the SObj struct, then
-    /// `SObj::from_struct(...).jobj_descs()[0].root_joint().unwrap()` to
-    /// reach the root joint.  HSDLib equivalent of `new HSDRawFile()` +
-    /// `file.Roots.Add(new HSDRootNode { Name = "scene_data", Data = …
-    /// })` with a fresh SOBJ tree set up underneath.
-    pub fn alloc_scene_data() -> Self {
+    /// "Minimal" here means:
+    ///   - the JOBJDescs array has exactly one slot
+    ///   - the SObj has **no** Cameras / Lights / Fog attached
+    ///
+    /// HSD SObj nodes used by some consumer runtimes additionally
+    /// reference COBJDesc / LObjDesc / FogDesc trees at SObj offsets
+    /// 0x04 / 0x08 / 0x0C — this factory doesn't wire those.  Until a
+    /// `_with_camera_light` factory lands (see `todo.md` §2.5 follow-up),
+    /// callers that need them attach the structs manually.
+    ///
+    /// Use `dat.find_root_for(...)` or `dat.roots[0].data.clone()` to
+    /// grab the SObj struct, then `SObj::from_struct(...).jobj_descs()[0]
+    /// .root_joint().unwrap()` to reach the root joint.  HSDLib
+    /// equivalent of `new HSDRawFile()` + `file.Roots.Add(new
+    /// HSDRootNode { Name = <root_name>, Data = … })` with a fresh SOBJ
+    /// tree set up underneath.
+    pub fn alloc_scene_data_minimal(root_name: &str) -> Self {
         use crate::common::{JObj, JObjDesc, SObj, build_jobj_descs_array};
 
         let root_joint = JObj::allocate_default();
@@ -143,7 +155,7 @@ impl Dat {
         Self {
             version: [0; 4],
             roots: vec![RootNode {
-                name: "scene_data".to_owned(),
+                name: root_name.to_owned(),
                 data: sobj.0,
             }],
             references: vec![],
@@ -154,6 +166,17 @@ impl Dat {
             // in tests/mutation.rs.
             struct_order: vec![],
         }
+    }
+
+    /// Back-compat shim for the original `alloc_scene_data()` factory.
+    /// Equivalent to [`Self::alloc_scene_data_minimal`] with root name
+    /// hard-coded to `"scene_data"`.
+    #[deprecated(
+        since = "0.0.2",
+        note = "renamed to `alloc_scene_data_minimal(root_name)`; the old name hard-coded `\"scene_data\"` as the root name, which not every HSD root carries"
+    )]
+    pub fn alloc_scene_data() -> Self {
+        Self::alloc_scene_data_minimal("scene_data")
     }
 }
 

@@ -5,7 +5,10 @@
 //! `scene_data.RootJoint.Child_N` and a top-level `*_joint` symbol).
 //!
 //! Usage:
-//!     MKGP2_FILES_DIR="..." cargo run -p hsdraw-cli --example survey_alias
+//!     HSDRAW_PARITY_CORPUS_DIR="..." cargo run -p hsdraw-cli --example survey_alias
+//!
+//! (The older `MKGP2_FILES_DIR` env name is still honored as a
+//! back-compat alias and will be dropped in a future release.)
 //!
 //! Output: `name, n_alias_roots`  for every file with at least one alias.
 
@@ -16,10 +19,12 @@ use std::rc::Rc;
 use hsdraw_core::{Dat, hsd_struct::collect_substructs};
 
 fn main() {
-    let dir = match std::env::var("MKGP2_FILES_DIR") {
+    let dir = match std::env::var("HSDRAW_PARITY_CORPUS_DIR")
+        .or_else(|_| std::env::var("MKGP2_FILES_DIR"))
+    {
         Ok(v) => PathBuf::from(v),
         Err(_) => {
-            eprintln!("MKGP2_FILES_DIR not set");
+            eprintln!("HSDRAW_PARITY_CORPUS_DIR not set");
             std::process::exit(2);
         }
     };

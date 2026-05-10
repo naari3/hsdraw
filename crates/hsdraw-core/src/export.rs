@@ -1,8 +1,15 @@
-//! Scene-level JSON export (Blender bundle).
+//! Scene-level JSON export.
 //!
-//! Mirrors `mkgp2-patch/tools/hsd/hsd_export_for_blender.csx` exactly so the
-//! parity test in `tests/parity/` can compare structure-by-structure with the
-//! csx golden.  See `docs/notes/phase0.md` §4 for the canonical schema.
+//! Read-side dump of an `HSDRawFile`-equivalent tree into a flat JSON
+//! schema (textures / materials / joints / joint_aliases / meshes).
+//! Intended as the structural representation a downstream tool (e.g. a
+//! Blender add-on) can drive its own scene-import pipeline against.
+//!
+//! The schema and field ordering are pinned by `tests/parity*.rs`
+//! (semantic JSON diff with ε = 1e-5); see `docs/notes/phase0.md` §4
+//! for the schema reference and `docs/notes/csx_export_parity.md` for
+//! the optional cross-check against the upstream `dotnet-script`
+//! golden output (which originally seeded this dump's field choices).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -155,7 +162,7 @@ fn export_one_root(ex: &mut Exporter, root: &RootNode) -> Result<()> {
     // Heuristic: HSDRawFile.GuessAccessor uses suffix matching.  For Phase 4
     // we treat any root whose struct length is JObj-sized (>= 0x40) as an
     // HSD_JOBJ — matches the csx "is HSD_JOBJ rj" branch on well-formed
-    // course corpora.
+    // JObj-root inputs.
     if len < 0x40 {
         return Ok(());
     }

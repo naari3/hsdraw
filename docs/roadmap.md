@@ -62,9 +62,9 @@ the upstream of csx in this regard.
 RGBA8 / RGB565 / RGB5A3 / CMP encoders ship in `gx_image::encode_image`
 (CMP via `texpresso` BC1 + GX-specific BE word swap + 8x8 super-block
 swizzle).  Plus the TObj / Image allocators in `common.rs` and the
-`Dat::alloc_scene_data` factory let an addon produce a self-contained
-.dat with no base file — see `tests/from_scratch.rs` for the
-end-to-end verification path.
+`Dat::alloc_scene_data_minimal` factory let an addon produce a
+self-contained .dat with no base file — see `tests/from_scratch.rs`
+for the end-to-end verification path.
 
 What's still deferred:
 

@@ -21,7 +21,8 @@ use hsdraw_core::accessor::Accessor;
 use hsdraw_core::common::{
     DObj as CoreDObj, Image as CoreImage, JObj as CoreJObj, JObjDesc as CoreJObjDesc,
     Lod as CoreLod, MObj as CoreMObj, Material as CoreMaterial, PObj as CorePObj,
-    PeDesc as CorePeDesc, SObj as CoreSObj, TObj as CoreTObj,
+    PeDesc as CorePeDesc, SObj as CoreSObj, TObj as CoreTObj, TexturedPreset,
+    UnlitColorPreset,
 };
 use hsdraw_core::dat::RootNode;
 use hsdraw_core::gx::{
@@ -29,7 +30,10 @@ use hsdraw_core::gx::{
     GxTlutFmt, GxWrapMode, JObjFlag, MaterialRenderMode, PObjFlag, TObjFlags,
 };
 use hsdraw_core::hsd_struct::{StructRef, ptr_eq};
-use hsdraw_core::pobj_writer::MeshBuilder as CoreMeshBuilder;
+use hsdraw_core::pobj_writer::{
+    ColorFormat as CoreColorFormat, MeshBuilder as CoreMeshBuilder,
+    NormalFormat as CoreNormalFormat, PosFormat as CorePosFormat, UvFormat as CoreUvFormat,
+};
 use hsdraw_core::{export, Dat as CoreDat};
 use pyo3::exceptions::{PyDeprecationWarning, PyIOError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -59,17 +63,51 @@ struct PyDat {
 
 #[pymethods]
 impl PyDat {
-    /// Allocate an empty `Dat` with a fresh `scene_data` root: SObj →
-    /// JOBJDescs[1] → JObjDesc → root JObj placeholder chain.  The root
-    /// joint has identity scale and zero TRS — wire children, DObjs,
-    /// etc. onto it before saving.  HSDLib equivalent: `new HSDRawFile()`
-    /// followed by manual SOBJ tree construction.  Useful for the
-    /// vanilla-independent export pipelines (no base .dat to start from).
+    /// Allocate an empty `Dat` with a single named root holding a
+    /// **minimal** SObj → JOBJDescs[1] → JObjDesc → root JObj placeholder
+    /// chain.  The root joint has identity scale and zero TRS — wire
+    /// children, DObjs, etc. onto it before saving.
+    ///
+    /// "Minimal" here means the SObj has *no* Cameras / Lights / Fog
+    /// attached.  HSD SObj nodes used by some consumer runtimes
+    /// additionally reference COBJDesc / LObjDesc / FogDesc trees;
+    /// this factory doesn't wire those.
+    ///
+    /// `root_name` defaults to `"scene_data"`, the most common HSD root
+    /// name, but the field is free-form (HSDLib `HSDRootNode.Name`) so
+    /// any string the target runtime expects works.
+    ///
+    /// HSDLib equivalent: `new HSDRawFile()` followed by manual SOBJ
+    /// tree construction.  Useful for vanilla-independent export
+    /// pipelines (no base .dat to start from).
     #[staticmethod]
-    fn alloc_scene_data() -> Self {
+    #[pyo3(signature = (root_name="scene_data"))]
+    fn alloc_scene_data_minimal(root_name: &str) -> Self {
         Self {
-            inner: Rc::new(RefCell::new(CoreDat::alloc_scene_data())),
+            inner: Rc::new(RefCell::new(CoreDat::alloc_scene_data_minimal(root_name))),
         }
+    }
+
+    /// Back-compat shim for the original `alloc_scene_data()` factory.
+    /// Equivalent to `alloc_scene_data_minimal(root_name="scene_data")`.
+    /// Emits a `DeprecationWarning` on use.
+    #[staticmethod]
+    fn alloc_scene_data(py: Python<'_>) -> PyResult<Self> {
+        pyo3::PyErr::warn(
+            py,
+            &py.get_type::<PyDeprecationWarning>(),
+            std::ffi::CString::new(
+                "Dat.alloc_scene_data() is deprecated; use Dat.alloc_scene_data_minimal(root_name=\"scene_data\") instead. The old name hard-coded the root name, which not every HSD root carries.",
+            )
+            .unwrap()
+            .as_c_str(),
+            1,
+        )?;
+        Ok(Self {
+            inner: Rc::new(RefCell::new(CoreDat::alloc_scene_data_minimal(
+                "scene_data",
+            ))),
+        })
     }
 
     /// Snapshot of every root, in declaration order (public + alias).
@@ -719,12 +757,13 @@ impl PyPObj {
 
     /// `POBJ_FLAG` bits as `u16`.  Bit positions match HSDLib's
     /// `POBJ_FLAG`: ENVELOPE=0x8000, SHAPESET=0x4000, CULLBACK=0x2000,
-    /// CULLFRONT=0x1000.  Note that real-world game corpora sometimes
-    /// repurpose these bits — most commonly 0x8000 on statically-bound
-    /// textured POBJs without an actual envelope-pointer array — which
-    /// `MeshBuilder.build` won't emit on its own.  Use the setter
-    /// below when you need to overwrite the flag word to match a
-    /// specific bit pattern.
+    /// CULLFRONT=0x1000.  Note that individual HSD-consuming runtimes
+    /// may repurpose these bits beyond HSDLib's canonical semantics
+    /// (one observed pattern is 0x8000 set on statically-bound
+    /// textured POBJs without an actual envelope-pointer array), and
+    /// `MeshBuilder.build` won't emit such off-spec patterns on its
+    /// own.  Use the setter below when you need to overwrite the flag
+    /// word to match a specific bit pattern.
     #[getter]
     fn flags(&self) -> PyResult<u16> {
         self.inner.borrow().get_u16(0x0C).map_err(map_err)
@@ -818,29 +857,70 @@ impl PyMObj {
         Self { inner: CoreMObj::allocate_default().0 }
     }
 
-    /// "Unlit single-color" preset.  Render flags = `CONSTANT |
-    /// DIFFUSE`; a fresh `Material` is attached with diffuse RGBA8 =
-    /// (r, g, b, a), alpha = 1.0, shininess = 50.0.  No textures, no
-    /// PE descriptor.  Useful as the placeholder material for a
-    /// brand-new mesh that doesn't have a real material yet.
+    /// "Unlit single-color" preset.  Default values: render flags =
+    /// `CONSTANT | DIFFUSE`, a fresh `Material` attached with diffuse
+    /// RGBA8 = (r, g, b, a), alpha = 1.0, shininess = 50.0.  No
+    /// textures, no PE descriptor.  Useful as the placeholder
+    /// material for a brand-new mesh that doesn't have a real
+    /// material yet.
     ///
-    /// Caveat: some HSD-format consumers will not bind any TObj on a
-    /// MObj that lacks `LIGHTMAP_DIFFUSE` (a TObj-side flag), so this
-    /// preset isn't suitable for textured rendering even after a TObj
-    /// is later attached.  Use `MObj.alloc_textured(material, image)`
-    /// for the textured-render preset.
+    /// Override individual fields via keyword arguments
+    /// (`render_flags=`, `alpha=`, `shininess=`) when the target
+    /// runtime needs different defaults.
+    ///
+    /// Caveat: this preset only wires render flags + diffuse Material
+    /// — it does *not* set the TObj-side `LIGHTMAP_DIFFUSE` flag, so a
+    /// TObj attached afterwards won't necessarily participate in the
+    /// downstream consumer's lighting pipeline.  Whether that matters
+    /// depends on the consumer's TEV stage configuration; if you need
+    /// a textured lit preset out of the box, use
+    /// `MObj.alloc_textured(material, image)` instead.
     #[staticmethod]
-    fn alloc_unlit_color(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self { inner: CoreMObj::allocate_unlit_color(r, g, b, a).0 }
+    #[pyo3(signature = (r, g, b, a, *, render_flags=None, alpha=None, shininess=None))]
+    fn alloc_unlit_color(
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+        render_flags: Option<u32>,
+        alpha: Option<f32>,
+        shininess: Option<f32>,
+    ) -> Self {
+        let mut preset = UnlitColorPreset::default();
+        if let Some(v) = render_flags {
+            preset.render_flags = MaterialRenderMode::from_bits_retain(v);
+        }
+        if let Some(v) = alpha {
+            preset.alpha = v;
+        }
+        if let Some(v) = shininess {
+            preset.shininess = v;
+        }
+        Self {
+            inner: CoreMObj::allocate_unlit_color_with(r, g, b, a, preset).0,
+        }
     }
 
     /// "Textured lit" preset: one-call wiring of MObj + a fresh TObj
-    /// pointing at the supplied `material` and `image`.  Sets render
-    /// flags to `CONSTANT | DIFFUSE | TEX0 | ALPHA_MAT`, allocates a
-    /// TObj with the field values widely seen on textured POBJs in
-    /// vanilla HSD course corpora (TG_TEX0, MODULATE color/alpha op,
-    /// REPEAT wrap, LINEAR mag, blending=1.0, LIGHTMAP_DIFFUSE on),
-    /// and attaches the supplied Image.
+    /// pointing at the supplied `material` and `image`.  Default
+    /// values match a "lit single-texture surface" stage layout
+    /// (render flags = `CONSTANT | DIFFUSE | TEX0 | ALPHA_MAT`,
+    /// TG_TEX0, MODULATE color/alpha op, REPEAT wrap, LINEAR mag,
+    /// blending=1.0, LIGHTMAP_DIFFUSE on).
+    ///
+    /// Override individual fields via keyword arguments:
+    ///
+    /// - `render_flags=<u32>` — bits in `MaterialRenderMode`
+    /// - `tex_map_id=<u32>` — `GxTexMapId` value
+    /// - `tex_gen_src=<u32>` — `GxTexGenSrc` value
+    /// - `scale=(sx, sy, sz)` — UV scale 3-tuple
+    /// - `wrap_s=<u32>` / `wrap_t=<u32>` — `GxWrapMode` value
+    /// - `repeat_s=<u8>` / `repeat_t=<u8>`
+    /// - `mag_filter=<u32>` — `GxTexFilter` value
+    /// - `color_op=<u32>` — `ColorMap` value
+    /// - `alpha_op=<u32>` — `AlphaMap` value
+    /// - `blending=<f32>`
+    /// - `lightmap_diffuse=<bool>`
     ///
     /// Caller responsibility:
     ///   - Build the `Material` first (e.g. `Material.new(amb=..., dif=...)`).
@@ -851,11 +931,88 @@ impl PyMObj {
     ///   - Attach a `Tlut` via `mobj.textures.set_tlut_data(...)` for
     ///     paletted image formats (`CI4` / `CI8` / `CI14X2`).
     #[staticmethod]
-    fn alloc_textured(material: &PyMaterial, image: &PyImage) -> Self {
+    #[pyo3(signature = (
+        material,
+        image,
+        *,
+        render_flags=None,
+        tex_map_id=None,
+        tex_gen_src=None,
+        scale=None,
+        wrap_s=None,
+        wrap_t=None,
+        repeat_s=None,
+        repeat_t=None,
+        mag_filter=None,
+        color_op=None,
+        alpha_op=None,
+        blending=None,
+        lightmap_diffuse=None,
+    ))]
+    fn alloc_textured(
+        material: &PyMaterial,
+        image: &PyImage,
+        render_flags: Option<u32>,
+        tex_map_id: Option<u32>,
+        tex_gen_src: Option<u32>,
+        scale: Option<(f32, f32, f32)>,
+        wrap_s: Option<u32>,
+        wrap_t: Option<u32>,
+        repeat_s: Option<u8>,
+        repeat_t: Option<u8>,
+        mag_filter: Option<u32>,
+        color_op: Option<u32>,
+        alpha_op: Option<u32>,
+        blending: Option<f32>,
+        lightmap_diffuse: Option<bool>,
+    ) -> Self {
+        let mut preset = TexturedPreset::default();
+        if let Some(v) = render_flags {
+            preset.render_flags = MaterialRenderMode::from_bits_retain(v);
+        }
+        if let Some(v) = tex_map_id {
+            preset.tex_map_id = GxTexMapId::from(v);
+        }
+        if let Some(v) = tex_gen_src {
+            preset.tex_gen_src = GxTexGenSrc::from(v);
+        }
+        if let Some(v) = scale {
+            preset.scale = [v.0, v.1, v.2];
+        }
+        if let Some(v) = wrap_s {
+            preset.wrap_s = GxWrapMode::from(v);
+        }
+        if let Some(v) = wrap_t {
+            preset.wrap_t = GxWrapMode::from(v);
+        }
+        if let Some(v) = repeat_s {
+            preset.repeat_s = v;
+        }
+        if let Some(v) = repeat_t {
+            preset.repeat_t = v;
+        }
+        if let Some(v) = mag_filter {
+            preset.mag_filter = GxTexFilter::from(v);
+        }
+        if let Some(v) = color_op {
+            preset.color_op = ColorMap::from(v);
+        }
+        if let Some(v) = alpha_op {
+            preset.alpha_op = AlphaMap::from(v);
+        }
+        if let Some(v) = blending {
+            preset.blending = v;
+        }
+        if let Some(v) = lightmap_diffuse {
+            preset.lightmap_diffuse = v;
+        }
         let mat = CoreMaterial::from_struct(material.inner.clone());
         let img = CoreImage::from_struct(image.inner.clone());
-        Self { inner: CoreMObj::allocate_textured(mat, img).0 }
+        Self {
+            inner: CoreMObj::allocate_textured_with(mat, img, preset).0,
+        }
     }
+
 
     #[staticmethod]
     fn from_struct(s: &PyHsdStruct) -> Self {
@@ -2146,12 +2303,14 @@ impl PyImage {
 // MeshBuilder  (HSDLib POBJ_Generator equivalent for Phase 1)
 // =====================================================================
 
-/// Phase 1 POBJ writer.  Push positions / normals / colors / UVs /
-/// triangles, then call `build()` for a `Pobj`.  See
-/// `docs/python_api.md` for the full surface; the constraints in one
-/// line: TRIANGLES only, ≤ 65,535 verts per POBJ, fixed attribute
-/// formats (POS F32×3, NRM F32×3, CLR0 RGBA8, TEX0 F32×2), no envelope
-/// rigging.
+/// POBJ writer.  Push positions / normals / colors / UVs / triangles,
+/// then call `build()` for a `Pobj`.  See `docs/python_api.md` for the
+/// full surface; the constraints in one line: TRIANGLES /
+/// TRIANGLE_STRIP, ≤ 65,535 verts per POBJ, attribute format defaults
+/// (`POS F32×3`, `NRM F32×3`, `CLR0 RGBA8`, `TEX0 F32×2`) can be
+/// overridden via `set_pos_format` / `set_normal_format` /
+/// `set_color_format` / `set_uv_format` — non-default variants are
+/// reserved placeholders for now (todo.md §2.7).
 #[pyclass(name = "MeshBuilder", module = "hsdraw", unsendable)]
 struct PyMeshBuilder {
     inner: RefCell<CoreMeshBuilder>,
@@ -2329,6 +2488,102 @@ impl PyMeshBuilder {
     /// HSDLib's output, or when you need predictable byte layouts).
     fn set_use_triangle_strips(&self, on: bool) {
         self.inner.borrow_mut().set_use_triangle_strips(on);
+    }
+
+    /// Choose the on-disk format for `GX_VA_POS`.  Default: `"F32x3"`.
+    /// `fmt` is one of `"F32x3"`, `"S16x3"`, `"S8x3"`; quantized
+    /// variants additionally take an `exponent` keyword (the decode
+    /// multiplier is `2^-exponent`).  Non-F32 variants are currently
+    /// reserved placeholders and `build()` rejects them; see
+    /// `todo.md` §2.7 for the rollout plan.
+    #[pyo3(signature = (fmt, *, exponent=None))]
+    fn set_pos_format(&self, fmt: &str, exponent: Option<u8>) -> PyResult<()> {
+        let f = match fmt {
+            "F32x3" => CorePosFormat::F32x3,
+            "S16x3" => CorePosFormat::S16x3 {
+                exponent: exponent.unwrap_or(0),
+            },
+            "S8x3" => CorePosFormat::S8x3 {
+                exponent: exponent.unwrap_or(0),
+            },
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "MeshBuilder.set_pos_format: unknown format {:?} (expected F32x3 / S16x3 / S8x3)",
+                    other
+                )));
+            }
+        };
+        self.inner.borrow_mut().set_pos_format(f);
+        Ok(())
+    }
+
+    /// Choose the on-disk format for `GX_VA_NRM`.  Default: `"F32x3"`.
+    /// See [`Self::set_pos_format`] for the format-name vocabulary and
+    /// the placeholder caveat.
+    #[pyo3(signature = (fmt, *, exponent=None))]
+    fn set_normal_format(&self, fmt: &str, exponent: Option<u8>) -> PyResult<()> {
+        let f = match fmt {
+            "F32x3" => CoreNormalFormat::F32x3,
+            "S16x3" => CoreNormalFormat::S16x3 {
+                exponent: exponent.unwrap_or(0),
+            },
+            "S8x3" => CoreNormalFormat::S8x3 {
+                exponent: exponent.unwrap_or(0),
+            },
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "MeshBuilder.set_normal_format: unknown format {:?} (expected F32x3 / S16x3 / S8x3)",
+                    other
+                )));
+            }
+        };
+        self.inner.borrow_mut().set_normal_format(f);
+        Ok(())
+    }
+
+    /// Choose the on-disk format for `GX_VA_CLR0`.  Default: `"Rgba8"`.
+    /// `fmt` is one of `"Rgba8"`, `"Rgb565"`, `"Rgba4"`.  Non-Rgba8
+    /// variants are currently reserved placeholders and `build()`
+    /// rejects them; see `todo.md` §2.7.
+    fn set_color_format(&self, fmt: &str) -> PyResult<()> {
+        let f = match fmt {
+            "Rgba8" => CoreColorFormat::Rgba8,
+            "Rgb565" => CoreColorFormat::Rgb565,
+            "Rgba4" => CoreColorFormat::Rgba4,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "MeshBuilder.set_color_format: unknown format {:?} (expected Rgba8 / Rgb565 / Rgba4)",
+                    other
+                )));
+            }
+        };
+        self.inner.borrow_mut().set_color_format(f);
+        Ok(())
+    }
+
+    /// Choose the on-disk format for `GX_VA_TEX0`.  Default: `"F32x2"`.
+    /// `fmt` is one of `"F32x2"`, `"S16x2"`, `"S8x2"`; quantized
+    /// variants additionally take an `exponent` keyword (the decode
+    /// multiplier is `2^-exponent`).
+    #[pyo3(signature = (fmt, *, exponent=None))]
+    fn set_uv_format(&self, fmt: &str, exponent: Option<u8>) -> PyResult<()> {
+        let f = match fmt {
+            "F32x2" => CoreUvFormat::F32x2,
+            "S16x2" => CoreUvFormat::S16x2 {
+                exponent: exponent.unwrap_or(0),
+            },
+            "S8x2" => CoreUvFormat::S8x2 {
+                exponent: exponent.unwrap_or(0),
+            },
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "MeshBuilder.set_uv_format: unknown format {:?} (expected F32x2 / S16x2 / S8x2)",
+                    other
+                )));
+            }
+        };
+        self.inner.borrow_mut().set_uv_format(f);
+        Ok(())
     }
 
     /// Phase 3: add a new envelope (one matrix slot's worth of bone

@@ -51,7 +51,7 @@ straight into Python without bringing project-specific schemas (e.g.
 | `MObj.render_flags` getter/setter       | `m.RenderFlags` (RENDER_MODE)                             | flag bits           |
 | `Material.alloc()` / `Material.new(amb=…, dif=…, spc=…, alpha=…, shininess=…)` + `.{amb,dif,spc}_rgba` + `.alpha` + `.shininess` | `new HSD_Material { … }` | material colors。`Material.new` は keyword-only named-arg ctor (default: amb=(0,0,0,0), dif=(255,255,255,255), spc=(255,255,255,255), alpha=1.0, shininess=50.0) |
 | `PeDesc.alloc()` + per-byte setters     | `new HSD_PEDesc { BlendMode=…, … }`                      | PE descriptor       |
-| `Dat.alloc_scene_data() -> Dat`         | `new HSDRawFile()` + manual SOBJ tree                     | from-scratch synthesis |
+| `Dat.alloc_scene_data_minimal(root_name="scene_data") -> Dat` | `new HSDRawFile()` + manual SOBJ tree | from-scratch synthesis (minimal SObj: no Cameras / Lights / Fog).  `Dat.alloc_scene_data()` remains as a `DeprecationWarning`-emitting back-compat shim with the root name hard-coded |
 | `SObj.alloc()` / `.from_struct(s)`      | `new HSD_SOBJ()` / `(HSD_SOBJ) s`                         | scene-object alloc / view |
 | `SObj.jobj_descs() -> [JObjDesc]`       | `sobj.JOBJDescs.Array`                                    | enumerate descriptors |
 | `SObj.set_jobj_descs([JObjDesc, …])`    | `sobj.JOBJDescs = HSDNullPointerArrayAccessor.From(…)`    | replace descriptor list |
@@ -307,15 +307,16 @@ pobj = mesh.build()
 
 ## End-to-end example: from-scratch synthesis (no base .dat)
 
-`Dat.alloc_scene_data()` produces an empty SObj → JOBJDescs[1] →
-JObjDesc → root JObj scaffold; from there you wire DObjs, MObjs,
+`Dat.alloc_scene_data_minimal(root_name="scene_data")` produces a
+**minimal** SObj → JOBJDescs[1] → JObjDesc → root JObj scaffold (no
+Cameras / Lights / Fog attached); from there you wire DObjs, MObjs,
 TObjs, and Images yourself.  Useful for the vanilla-independent
 export pipeline (no base file to start from):
 
 ```python
 import hsdraw
 
-dat  = hsdraw.Dat.alloc_scene_data()
+dat  = hsdraw.Dat.alloc_scene_data_minimal()      # root_name defaults to "scene_data"
 sobj = hsdraw.SObj.from_struct(dat.scene_data().data)
 root = sobj.jobj_descs()[0].root_joint           # placeholder JObj
 
@@ -349,7 +350,7 @@ root.set_dobj(dobj)
 open("from_scratch.dat", "wb").write(dat.write())
 ```
 
-The chain `Dat.alloc_scene_data → ... → Image.set_image_data_bytes`
+The chain `Dat.alloc_scene_data_minimal → ... → Image.set_image_data_bytes`
 covers everything an addon needs to produce a self-contained .dat
 without holding a vanilla base file.  See
 `crates/hsdraw-core/tests/from_scratch.rs` for the round-trip

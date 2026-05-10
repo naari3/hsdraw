@@ -30,7 +30,7 @@ fn root_joint(dat: &Dat) -> JObj {
 #[test]
 fn from_scratch_scene_data_with_textured_mesh_round_trips() {
     // ---- Phase 1: scaffold ---------------------------------------
-    let dat = Dat::alloc_scene_data();
+    let dat = Dat::alloc_scene_data_minimal("scene_data");
     let root = root_joint(&dat);
 
     // ---- Phase 2: a 4x4 RGBA8 source we encode + attach ----------
@@ -154,7 +154,7 @@ fn from_scratch_scene_data_with_two_joints_and_one_textured_mesh() {
     // mesh.  Validates that adding a child JObj to the from-scratch
     // factory chain doesn't disturb the SObj→JOBJDescs→RootJoint
     // round-trip.
-    let dat = Dat::alloc_scene_data();
+    let dat = Dat::alloc_scene_data_minimal("scene_data");
     let root = root_joint(&dat);
     root.set_tx(0.0).unwrap();
 

@@ -171,6 +171,75 @@ impl DObj {
 // MObj  (HSDRaw/Common/HSD_MOBJ.cs, TrimmedSize 0x18)
 // =====================================================================
 
+/// Tweakable inputs for [`MObj::allocate_textured_with`].
+///
+/// Field defaults model a "lit single-texture surface" TEV stage
+/// layout — one of the simplest HSD textured-render configurations.
+/// Override individual fields when the target runtime expects a
+/// different stage layout (multi-texture, projected, decal, etc.)
+/// without having to drop down to manual `TObj` construction.
+#[derive(Debug, Clone, Copy)]
+pub struct TexturedPreset {
+    pub render_flags: MaterialRenderMode,
+    pub tex_map_id: GxTexMapId,
+    pub tex_gen_src: GxTexGenSrc,
+    pub scale: [f32; 3],
+    pub wrap_s: GxWrapMode,
+    pub wrap_t: GxWrapMode,
+    pub repeat_s: u8,
+    pub repeat_t: u8,
+    pub mag_filter: GxTexFilter,
+    pub color_op: ColorMap,
+    pub alpha_op: AlphaMap,
+    pub blending: f32,
+    pub lightmap_diffuse: bool,
+}
+
+impl Default for TexturedPreset {
+    fn default() -> Self {
+        Self {
+            render_flags: MaterialRenderMode::CONSTANT
+                | MaterialRenderMode::DIFFUSE
+                | MaterialRenderMode::TEX0
+                | MaterialRenderMode::ALPHA_MAT,
+            tex_map_id: GxTexMapId::GX_TEXMAP0,
+            tex_gen_src: GxTexGenSrc::GX_TG_TEX0,
+            scale: [1.0, 1.0, 1.0],
+            wrap_s: GxWrapMode::REPEAT,
+            wrap_t: GxWrapMode::REPEAT,
+            repeat_s: 1,
+            repeat_t: 1,
+            mag_filter: GxTexFilter::GX_LINEAR,
+            color_op: ColorMap::MODULATE,
+            alpha_op: AlphaMap::MODULATE,
+            blending: 1.0,
+            lightmap_diffuse: true,
+        }
+    }
+}
+
+/// Tweakable inputs for [`MObj::allocate_unlit_color_with`].
+///
+/// Defaults: `render_flags = CONSTANT | DIFFUSE`, `alpha = 1.0`,
+/// `shininess = 50.0` (HSDLib's post-`Trim` default).
+#[derive(Debug, Clone, Copy)]
+pub struct UnlitColorPreset {
+    pub render_flags: MaterialRenderMode,
+    pub alpha: f32,
+    pub shininess: f32,
+}
+
+impl Default for UnlitColorPreset {
+    fn default() -> Self {
+        Self {
+            render_flags: MaterialRenderMode::CONSTANT
+                | MaterialRenderMode::DIFFUSE,
+            alpha: 1.0,
+            shininess: 50.0,
+        }
+    }
+}
+
 accessor!(MObj);
 
 impl MObj {
@@ -196,20 +265,33 @@ impl MObj {
     /// no textures, no PE descriptor.  Useful as a placeholder when
     /// the addon doesn't yet have a real material to point at.
     ///
-    /// Caveat: some HSD-format consumers will not bind any TObj on a
-    /// MObj that lacks `LIGHTMAP_DIFFUSE` (a TObj-side flag), so this
-    /// preset isn't suitable for textured rendering even after a TObj
-    /// is later attached.  Use [`Self::allocate_textured`] for the
-    /// textured-render preset.
+    /// Caveat: this preset only wires render flags + diffuse Material
+    /// — it does *not* set the TObj-side `LIGHTMAP_DIFFUSE` flag, so a
+    /// TObj attached afterwards won't necessarily participate in the
+    /// downstream consumer's lighting pipeline.  Whether that matters
+    /// depends on the consumer's TEV stage configuration; if you need
+    /// a textured lit preset out of the box, use
+    /// [`Self::allocate_textured`] instead.
     pub fn allocate_unlit_color(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self::allocate_unlit_color_with(r, g, b, a, UnlitColorPreset::default())
+    }
+
+    /// Identical to [`Self::allocate_unlit_color`] but lets the caller
+    /// override the render-flag word, the Material alpha, and the
+    /// Material shininess via a [`UnlitColorPreset`].
+    pub fn allocate_unlit_color_with(
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+        preset: UnlitColorPreset,
+    ) -> Self {
         let mobj = Self::allocate_default();
-        let _ = mobj.set_render_flags(
-            MaterialRenderMode::CONSTANT | MaterialRenderMode::DIFFUSE,
-        );
+        let _ = mobj.set_render_flags(preset.render_flags);
         let mat = Material::allocate_default();
         let _ = mat.set_dif_rgba([r, g, b, a]);
-        let _ = mat.set_alpha(1.0);
-        let _ = mat.set_shininess(50.0);
+        let _ = mat.set_alpha(preset.alpha);
+        let _ = mat.set_shininess(preset.shininess);
         mobj.set_material(Some(mat));
         mobj
     }
@@ -222,17 +304,19 @@ impl MObj {
     ///
     /// What this builds:
     ///   - `MObj.render_flags` = `CONSTANT | DIFFUSE | TEX0 | ALPHA_MAT`
-    ///     — the bit pattern HSD-format consumers use to enable both
-    ///     the diffuse-lighting stage and the TEX0 sampler.
+    ///     — a bit pattern that enables both the diffuse-lighting stage
+    ///     and the TEX0 sampler on a typical HSD TEV pipeline.
     ///   - `Material` is attached as-is (caller controls the colors).
     ///   - A fresh `TObj` with: `tex_map_id = GX_TEXMAP0`,
     ///     `tex_gen_src = GX_TG_TEX0`, `coord_type = UV`,
     ///     `color_op = MODULATE`, `alpha_op = MODULATE`, `scale =
     ///     (1, 1, 1)`, `wrap_s = wrap_t = REPEAT`, `repeat_s =
     ///     repeat_t = 1`, `mag_filter = GX_LINEAR`, `blending =
-    ///     1.0`, and `LIGHTMAP_DIFFUSE` set.  These are the field
-    ///     values widely seen on textured POBJs across the HSD
-    ///     vanilla course corpus.
+    ///     1.0`, and `LIGHTMAP_DIFFUSE` set.  This is one observed
+    ///     runtime convention for "lit single-texture surface" in HSD
+    ///     content; callers whose target runtime expects a different
+    ///     stage layout (multi-texture, projected, etc.) should build
+    ///     the TObj manually instead.
     ///   - `Image` is attached as `TObj.image_data`.
     ///
     /// What this does **not** wire up:
@@ -241,33 +325,42 @@ impl MObj {
     ///   - TLUT — for paletted image formats the caller has to
     ///     attach `Tlut` separately via `tobj.set_tlut_data(...)`.
     pub fn allocate_textured(material: Material, image: Image) -> Self {
+        Self::allocate_textured_with(material, image, TexturedPreset::default())
+    }
+
+    /// Identical to [`Self::allocate_textured`] but lets the caller
+    /// override individual TObj / render-flag fields via a
+    /// [`TexturedPreset`].  Use this when the target runtime expects
+    /// a different TEV stage layout (multi-texture, projected,
+    /// decal, etc.) than the default course-mesh field pattern.
+    pub fn allocate_textured_with(
+        material: Material,
+        image: Image,
+        preset: TexturedPreset,
+    ) -> Self {
         let mobj = Self::allocate_default();
-        let _ = mobj.set_render_flags(
-            MaterialRenderMode::CONSTANT
-                | MaterialRenderMode::DIFFUSE
-                | MaterialRenderMode::TEX0
-                | MaterialRenderMode::ALPHA_MAT,
-        );
+        let _ = mobj.set_render_flags(preset.render_flags);
         mobj.set_material(Some(material));
 
         let tobj = TObj::allocate_default();
-        let _ = tobj.set_tex_map_id(GxTexMapId::GX_TEXMAP0);
-        let _ = tobj.set_tex_gen_src(GxTexGenSrc::GX_TG_TEX0);
-        let _ = tobj.set_scale(1.0, 1.0, 1.0);
-        let _ = tobj.set_wrap_s(GxWrapMode::REPEAT);
-        let _ = tobj.set_wrap_t(GxWrapMode::REPEAT);
-        let _ = tobj.set_repeat_s(1);
-        let _ = tobj.set_repeat_t(1);
-        let _ = tobj.set_blending(1.0);
-        let _ = tobj.set_mag_filter(GxTexFilter::GX_LINEAR);
-        let _ = tobj.set_color_operation(ColorMap::MODULATE);
-        let _ = tobj.set_alpha_operation(AlphaMap::MODULATE);
-        let _ = tobj.set_lightmap_diffuse(true);
+        let _ = tobj.set_tex_map_id(preset.tex_map_id);
+        let _ = tobj.set_tex_gen_src(preset.tex_gen_src);
+        let _ = tobj.set_scale(preset.scale[0], preset.scale[1], preset.scale[2]);
+        let _ = tobj.set_wrap_s(preset.wrap_s);
+        let _ = tobj.set_wrap_t(preset.wrap_t);
+        let _ = tobj.set_repeat_s(preset.repeat_s);
+        let _ = tobj.set_repeat_t(preset.repeat_t);
+        let _ = tobj.set_blending(preset.blending);
+        let _ = tobj.set_mag_filter(preset.mag_filter);
+        let _ = tobj.set_color_operation(preset.color_op);
+        let _ = tobj.set_alpha_operation(preset.alpha_op);
+        let _ = tobj.set_lightmap_diffuse(preset.lightmap_diffuse);
         tobj.set_image_data(Some(image));
 
         mobj.set_textures(Some(tobj));
         mobj
     }
+
 
     pub fn set_render_flags(&self, flags: MaterialRenderMode) -> Result<()> {
         self.ensure_mobj_size();

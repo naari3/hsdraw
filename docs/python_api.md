@@ -59,14 +59,19 @@ straight into Python without bringing project-specific schemas (e.g.
 | `TObj.alloc()` + per-field setters      | `new HSD_TOBJ { … }`                                      | texture-object alloc |
 | `TObj.set_image_data(img)` / `.set_tlut_data(t)` | `tobj.ImageData = …` / `.TLUTData = …`           | image / palette refs |
 | `TObj.set_coord_type(c)` / `.set_color_operation(o)` / `.set_alpha_operation(o)` | `tobj.CoordType=` / `.ColorOperation=` / `.AlphaOperation=` (nibble-preserving) | flag nibbles |
+| `TObj.tex_gen_src` (property; assign `int` to set) | `tobj.GXTexGenSrc` (HSD_TOBJ offset 0x0C `u32`) | tex-gen source — raw `GXTexGenSrc` enum int (`GX_TG_POS`=0, `GX_TG_TEX0`=4, …) |
+| `TObj.set_flag_bit(mask, on)` | (none — bit-RMW helper) | preserves coord/color/alpha nibbles |
+| `TObj.set_lightmap_{diffuse,specular,ambient,ext,shadow}(b)` / `.set_bump(b)` | `tobj.Flags |= LIGHTMAP_*` / `BUMP` | named flag setters (RMW) |
+| `TObj.is_lightmap_{diffuse,specular,ambient,ext,shadow}()` / `.is_bump()` | `(tobj.Flags & LIGHTMAP_*) != 0` | named flag getters |
 | `Image.alloc()` + `.set_image_data_bytes(b)` | `new HSD_Image { ImageData = HSDStruct(b) }`         | image alloc + payload |
 | `Image.{width,height,format,mipmap,min_lod,max_lod}` | `img.Width` / `.Height` / `.Format` / `.MipMap` / `.LODBias` / `.MaxLOD` | per-field setters |
-| `hsdraw.gx_encode(format, w, h, rgba) -> bytes` | `GXImageConverter.EncodeImage(GX_TF_*, w, h, rgba)` | RGBA8 → GX bytes encoder (RGBA8 / RGB565 / RGB5A3 / CMP only) |
+| `hsdraw.gx_encode(format, w, h, rgba, swap_rb_for_rgb5a3=False) -> bytes` | `GXImageConverter.EncodeImage(GX_TF_*, w, h, rgba)` | RGBA8 → GX bytes encoder (RGBA8 / RGB565 / RGB5A3 / CMP only); `swap_rb_for_rgb5a3=True` で RGB5A3 のみ R/B を事前スワップ (BGR-order sampler 向け) |
 | `hsdraw.gx_decode(format, w, h, gx_bytes, palette=None, palette_format=2) -> bytes` | `GXImageConverter.DecodeImage(GX_TF_*, w, h, raw, tlutFmt, tlutData)` | GX bytes → RGBA8 decoder (all formats, RGBA-ordered output, BGRA swap done in core) |
 | `HsdStruct.byte_size()` / `.raw()`      | `_s.Length` / `_s.GetData()`                              | introspection       |
 | `HsdStruct.references() -> [(off, target)]` | `_s.References`                                       | walk raw refs       |
 | `HsdStruct.get_reference(offset)`       | `_s.GetReference<HSDAccessor>(offset)` (sans typed cast)  | offset lookup       |
 | `HsdStruct.set_reference(offset, target_or_None)` | `_s.SetReference(offset, target)`                | deep-field repoint  |
+| `HsdStruct.set_u8(offset, v)` / `.set_u16(offset, v)` / `.set_u32(offset, v)` / `.set_bytes(offset, b)` | `_s.SetByte(offset, v)` / `.SetInt16(…)` / `.SetInt32(…)` / `.SetBytes(…)` | byte-level patch primitives |
 | `__eq__` / `__hash__` on JObj/HsdStruct | `obj._s == other._s` / `RuntimeHelpers.GetHashCode(_s)`   | identity comparison |
 
 ## Quick reference
@@ -80,11 +85,14 @@ straight into Python without bringing project-specific schemas (e.g.
   verified against csx `hsd_export_for_blender.csx`).
 - `hsdraw.write_dat(bytes, optimize=True, buffer_align=True) -> bytes`
   — same as `Dat.write()` for callers that don't want to hold a `Dat`.
-- `hsdraw.gx_encode(format, width, height, rgba) -> bytes` —
+- `hsdraw.gx_encode(format, width, height, rgba, swap_rb_for_rgb5a3=False) -> bytes` —
   RGBA8 → GX-format byte payload.  `format` is the `GxTexFmt` integer
   (4=RGB565, 5=RGB5A3, 6=RGBA8, 14=CMP); other values raise
   `ValueError`.  Output is padded to the format's natural tile
   boundary; feed it into `Image.set_image_data_bytes(...)`.
+  `swap_rb_for_rgb5a3=True` で RGB5A3 経路の R / B チャンネルを事前
+  スワップ — BGR-order でサンプルするレンダラー向けのオプション。
+  RGB5A3 以外には作用しない。
 - `hsdraw.gx_decode(format, width, height, gx_bytes, palette=None,
   palette_format=2) -> bytes` — inverse of `gx_encode`, plus support
   for I4 / I8 / IA4 / IA8 / CIxx (palette mandatory for CIxx;
@@ -210,7 +218,9 @@ mesh.add_color(0xFF, 0x00, 0x00, 0xFF)   # red, full alpha
 mesh.add_color(0xFF, 0x00, 0x00, 0xFF)
 mesh.add_color(0xFF, 0x00, 0x00, 0xFF)
 mesh.add_triangle(0, 1, 2)
-mesh.set_cull_back(True)                  # POBJ_FLAG.CULLBACK
+# NOTE: mesh.set_cull_back / set_cull_front are deprecated — POBJ.flags
+# 0x4000 / 0x8000 collide with POBJ_TYPE_MASK (SHAPEANIM / ENVELOPE).
+# Face culling is on the MObj/RenderFlags side, not POBJ-side.
 pobj = mesh.build()                       # -> hsdraw.Pobj
 
 # ---- 2. shell DObj (material attach is up to the caller) ----------
@@ -242,6 +252,12 @@ open("out.dat", "wb").write(dat.write())
   references envelopes added via `add_envelope([(jobj, weight), …])`.
   Sets `POBJ_FLAG.ENVELOPE`, emits `GX_VA_PNMTXIDX` direct attribute.
   Up to 85 envelopes per POBJ (matrix-slot range); split above that.
+
+> **Deprecated**: `MeshBuilder.set_cull_back` / `set_cull_front` —
+> the values 0x4000 / 0x8000 collide with `POBJ_TYPE_MASK`
+> (`SHAPEANIM` / `ENVELOPE`).  Calling either is a no-op; the PyO3
+> binding emits `DeprecationWarning`.  Express culling through the
+> MObj/RenderFlags side instead.
 
 ### Limits
 
@@ -333,6 +349,34 @@ covers everything an addon needs to produce a self-contained .dat
 without holding a vanilla base file.  See
 `crates/hsdraw-core/tests/from_scratch.rs` for the round-trip
 verification path the CI gates on.
+
+## Recipes — byte-level patches / TObj fine-tuning
+
+```python
+import hsdraw
+
+# (1) GXTexGenSrc (offset 0x0C u32) — exposed as a Python property,
+#     so assign the raw GX enum integer.  0=GX_TG_POS (default),
+#     4=GX_TG_TEX0, etc.  See HSDLib's GXTexGenSrc enum or
+#     hsdraw_core::gx::GxTexGenSrc for the full set.
+tobj.tex_gen_src = 4               # GX_TG_TEX0
+assert tobj.tex_gen_src == 4
+
+# (2) Lightmap / bump named setters do bit-RMW on Flags, preserving
+#     the coord_type / color_op / alpha_op nibbles.
+tobj.set_lightmap_diffuse(True)
+tobj.set_bump(False)
+assert tobj.is_lightmap_diffuse() and not tobj.is_bump()
+
+# (3) BGR-order RGB5A3 sampler — pre-swap R/B at encode time.
+gx = hsdraw.gx_encode(5, w, h, rgba, swap_rb_for_rgb5a3=True)
+
+# (4) Byte-level patch on any HsdStruct (no post-write find/replace).
+s = tobj.as_struct()
+s.set_u32(0x0C, 4)                          # GX_TG_TEX0 in raw bytes
+s.set_u8(0x40, s.raw()[0x40] | 0x10)        # LIGHTMAP_DIFFUSE bit on
+s.set_bytes(0x20, b"\x00" * 4)              # blank 4 bytes at 0x20
+```
 
 ## Limitations (deliberate non-goals)
 

@@ -21,9 +21,9 @@ side mesh data, and serialize back — all without depending on
 | **PyO3** | abi3-py37 wheel covers Python 3.7+; identity-aware `__eq__` / `__hash__` on every typed view |
 | **CI** | `cargo test` on Linux / macOS / Windows + 5-platform abi3 wheel matrix via maturin |
 
-Test totals: **70 passing** env-free (18 unit + 12 mutation primitive +
-4 parity + 14 POBJ writer round-trip + 10 MObj / Material / PeDesc /
-TObj / Image round-trip + 10 GX texture encoder + 2 from-scratch
+Test totals: **78 passing** env-free (20 unit + 12 mutation primitive +
+4 parity + 15 POBJ writer round-trip + 12 MObj / Material / PeDesc /
+TObj / Image round-trip + 13 GX texture encoder + 2 from-scratch
 chain).  With `MKGP2_FILES_DIR` + `MKGP2_PATCH_DIR` set, an additional
 6 csx-parity courses + 9-file writer round-trip corpus run.
 
@@ -39,9 +39,9 @@ chain).  With `MKGP2_FILES_DIR` + `MKGP2_PATCH_DIR` set, an additional
 | `PeDesc` | `alloc`, `blend_mode`, `src_factor`, `dst_factor`, `depth_function`, `alpha_*`, … |
 | `SObj` | `alloc`, `jobj_descs`, `set_jobj_descs`, `jobj_descs_array` |
 | `JObjDesc` | `alloc`, `root_joint`, `set_root_joint` |
-| `TObj` | `alloc`, `set_tex_map_id`, `set_rotation` / `set_scale` / `set_translation`, `set_wrap_s` / `_t`, `set_repeat_*`, `set_flags` + nibble setters (`coord_type` / `color_op` / `alpha_op`), `set_blending`, `set_mag_filter`, `set_image_data`, `set_tlut_data`, `set_next` |
+| `TObj` | `alloc`, `set_tex_map_id`, `set_rotation` / `set_scale` / `set_translation`, `set_wrap_s` / `_t`, `set_repeat_*`, `set_flags` + nibble setters (`coord_type` / `color_op` / `alpha_op`), `set_blending`, `set_mag_filter`, `set_image_data`, `set_tlut_data`, `set_next`, `tex_gen_src` (property — `GXTexGenSrc` u32 at 0x0C), `set_flag_bit(mask, on)`, `set_lightmap_{diffuse,specular,ambient,ext,shadow}` / `set_bump` (bit-RMW; preserves coord/color/alpha nibbles) |
 | `Image` | `alloc`, `set_image_data_bytes`, `set_width` / `_height`, `set_format`, `set_mipmap`, `set_min_lod` / `_max_lod` |
-| `HsdStruct` | `byte_size`, `raw`, `references`, `get_reference`, `set_reference` |
+| `HsdStruct` | `byte_size`, `raw`, `references`, `get_reference`, `set_reference`, `set_u8` / `set_u16` / `set_u32` / `set_bytes` (byte-level patch primitives) |
 
 These mirror HSDLib's accessor / setter pairs at the byte-offset level;
 nothing here carries project-specific schemas.  See
@@ -67,6 +67,12 @@ side mesh data:
   emits `GX_VA_PNMTXIDX` as a DIRECT 1-byte per-vertex attribute, wires
   the null-terminated envelope-pointer array at POBJ + 0x14.  Up to 85
   envelopes per POBJ (matrix-slot range).
+
+`MeshBuilder.set_cull_back` / `set_cull_front` are **deprecated** —
+the values they used to fold into POBJ.flags (0x4000 / 0x8000) collide
+with `POBJ_TYPE_MASK` (`SHAPEANIM` / `ENVELOPE`) in HSDLib's `POBJ_FLAG`
+enum.  Calling them is a no-op (a `DeprecationWarning` is raised on the
+PyO3 side); face culling lives on the MObj/RenderFlags side instead.
 
 Fixed attribute encoding: POS F32×3, NRM F32×3, CLR0 RGBA8, TEX0 F32×2.
 Multi-format / quantized buffers and a vertex-cache-aware stripper
@@ -113,7 +119,7 @@ manually via **Actions → wheels → Run workflow** or push a `v*` tag.
 
 ```bash
 cargo test --workspace
-# → 52 PASS, env-free
+# → 78 PASS, env-free
 ```
 
 For the corpus comparisons (requires `dotnet-script` on PATH plus a

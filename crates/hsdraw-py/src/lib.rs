@@ -2718,12 +2718,13 @@ fn export_scene_json(
 
 /// Encode RGBA8 source bytes into a GX texture format payload.
 /// Wraps `hsdraw_core::gx_image::encode_image_with_options`: pass
-/// `format` as the `GxTexFmt` integer (4=RGB565, 5=RGB5A3, 6=RGBA8,
-/// 14=CMP) and the raw RGBA8 source as `bytes` of exactly
-/// `4 * width * height` bytes.  Output dimensions get padded to the
-/// format's natural tile boundary (4 or 8), so the byte count matches
-/// what `decode_image` consumes.  Other formats (I4/I8/IA4/IA8/CIxx)
-/// raise `ValueError`.
+/// `format` as the `GxTexFmt` integer (0=I4, 1=I8, 2=IA4, 3=IA8,
+/// 4=RGB565, 5=RGB5A3, 6=RGBA8, 14=CMP) and the raw RGBA8 source as
+/// `bytes` of exactly `4 * width * height` bytes.  Output dimensions
+/// get padded to the format's natural tile boundary (4 or 8), so the
+/// byte count matches what `decode_image` consumes.  Paletted formats
+/// (CI4 / CI8 / CI14X2) need a TLUT and route through
+/// `gx_encode_paletted` instead.
 ///
 /// `swap_rb_for_rgb5a3` (kwarg, default `False`): pre-swap R↔B in the
 /// source RGBA before the RGB5A3 encode loop.  Use when the target
@@ -2750,6 +2751,66 @@ fn gx_encode<'py>(
     )
     .map_err(|e| PyValueError::new_err(format!("gx_encode: {:?}", e)))?;
     Ok(PyBytes::new(py, &out))
+}
+
+/// Encode an RGBA8 image into one of the GX paletted texture formats
+/// (CI4 / CI8 / CI14X2), producing both the image-side index bytes and
+/// the TLUT-side palette bytes in a single call.
+///
+/// `format` is the `GxTexFmt` integer (8=CI4, 9=CI8, 10=CI14X2).
+/// `tlut_format` is the `GxTlutFmt` integer (0=IA8, 1=RGB565, 2=RGB5A3)
+/// — `RGB5A3` is the most common course-asset choice and the default.
+/// `max_palette` (optional) caps the palette size below the format max
+/// (16 / 256 / 16384) — useful for runtimes with stricter TLUT budgets.
+///
+/// Returns a 3-tuple `(image_bytes, palette_bytes, palette_rgba)`:
+///   - `image_bytes`: GX-format index bytes (slot in `Image.image_data`).
+///   - `palette_bytes`: TLUT-format palette bytes (slot in
+///     `Tlut.palette_bytes`); `2 * len(palette_rgba)` bytes long.
+///   - `palette_rgba`: the quantized palette as raw RGBA8, `4 *
+///     palette_size` bytes — handy for debugging / pre-quantized
+///     re-encodes.
+#[pyfunction]
+#[pyo3(signature = (
+    format,
+    width,
+    height,
+    rgba,
+    /,
+    tlut_format = 2,
+    max_palette = None,
+))]
+fn gx_encode_paletted<'py>(
+    py: Python<'py>,
+    format: u32,
+    width: u32,
+    height: u32,
+    rgba: &Bound<'_, PyBytes>,
+    tlut_format: u32,
+    max_palette: Option<usize>,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let fmt = GxTexFmt::from(format);
+    let tlut_fmt = hsdraw_core::gx::GxTlutFmt::from(tlut_format);
+    let out = hsdraw_core::gx_image::encode_paletted_image(
+        fmt,
+        width,
+        height,
+        rgba.as_bytes(),
+        tlut_fmt,
+        max_palette,
+    )
+    .map_err(|e| PyValueError::new_err(format!("gx_encode_paletted: {:?}", e)))?;
+    // Flatten the palette_rgba `Vec<[u8; 4]>` into a flat `Vec<u8>` for
+    // the Python side.
+    let mut pal_flat = Vec::with_capacity(out.palette_rgba.len() * 4);
+    for c in &out.palette_rgba {
+        pal_flat.extend_from_slice(c);
+    }
+    Ok((
+        PyBytes::new(py, &out.image),
+        PyBytes::new(py, &out.palette_bytes),
+        PyBytes::new(py, &pal_flat),
+    ))
 }
 
 /// Decode a GX texture format payload back to RGBA8.
@@ -2888,6 +2949,7 @@ fn hsdraw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(export_scene_json, m)?)?;
     m.add_function(wrap_pyfunction!(write_dat, m)?)?;
     m.add_function(wrap_pyfunction!(gx_encode, m)?)?;
+    m.add_function(wrap_pyfunction!(gx_encode_paletted, m)?)?;
     m.add_function(wrap_pyfunction!(gx_decode, m)?)?;
     m.add_class::<PyDat>()?;
     m.add_class::<PyRoot>()?;

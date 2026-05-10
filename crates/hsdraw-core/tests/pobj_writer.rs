@@ -846,39 +846,239 @@ fn format_setters_with_defaults_match_no_setter_path() {
     );
 }
 
+/// `S16×3` quantized POS: `round(v * (1 << exponent))` clamped to i16,
+/// the GX `Scale` field set to `exponent` so the decoder's
+/// `raw / (1 << scale)` step recovers the original.  We use exponent=8
+/// (= 1/256 unit) which fits the [-1, +1] inputs in this test with
+/// ~0.004 quantization error per component.
 #[test]
-fn pos_format_s16x3_is_rejected_until_implemented() {
+fn pos_format_s16x3_round_trips_via_attribute_scale() {
     let mut mb = MeshBuilder::new();
     mb.add_position(0.0, 0.0, 0.0);
-    mb.add_position(1.0, 0.0, 0.0);
-    mb.add_position(0.0, 1.0, 0.0);
+    mb.add_position(1.0, 0.5, -0.25);
+    mb.add_position(-0.75, 0.125, 0.0);
     mb.add_triangle(0, 1, 2);
     mb.set_pos_format(PosFormat::S16x3 { exponent: 8 });
-    let err = mb.build().unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("S16x3") && msg.contains("not yet implemented"),
-        "expected unsupported-format error mentioning S16x3, got: {}",
-        msg
-    );
+    let pobj = mb.build().expect("build with S16x3");
+
+    let dat = round_trip(dat_with_pobj(pobj));
+    let dl = unpack_first_pobj(&dat);
+
+    let pos = dl
+        .attributes
+        .iter()
+        .find(|a| a.name == GxAttribName::GX_VA_POS)
+        .expect("POS attribute");
+    assert_eq!(pos.stride, 6, "S16x3 stride is 6 bytes");
+    // GxCompType::Int16 = 3.
+    assert_eq!(pos.comp_type, 3);
+    assert_eq!(pos.scale, 8);
+
+    let v = &dl.primitives[0].vertices;
+    // 1/256 quantization: error per component is at most 0.5 LSB ≈ 0.002.
+    let eps = 1.0 / 256.0;
+    for (got, want) in v
+        .iter()
+        .map(|vert| vert.pos)
+        .zip([[0.0, 0.0, 0.0], [1.0, 0.5, -0.25], [-0.75, 0.125, 0.0]])
+    {
+        for axis in 0..3 {
+            assert!(
+                (got[axis] - want[axis]).abs() <= eps,
+                "axis {} differs by more than 1 LSB: got {} want {}",
+                axis,
+                got[axis],
+                want[axis]
+            );
+        }
+    }
 }
 
+/// `S8×3` quantized POS: same scheme as S16x3 but `i8` per component.
+/// Range is much tighter — `exponent=4` (= 1/16 unit) covers [-8, +8]
+/// with ~0.06 max quantization error.
 #[test]
-fn color_format_rgb565_is_rejected_until_implemented() {
+fn pos_format_s8x3_round_trips_via_attribute_scale() {
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.5, -0.25);
+    mb.add_position(-0.75, 0.125, 0.0);
+    mb.add_triangle(0, 1, 2);
+    mb.set_pos_format(PosFormat::S8x3 { exponent: 4 });
+    let pobj = mb.build().expect("build with S8x3");
+
+    let dat = round_trip(dat_with_pobj(pobj));
+    let dl = unpack_first_pobj(&dat);
+
+    let pos = dl
+        .attributes
+        .iter()
+        .find(|a| a.name == GxAttribName::GX_VA_POS)
+        .expect("POS attribute");
+    assert_eq!(pos.stride, 3);
+    // GxCompType::Int8 = 1.
+    assert_eq!(pos.comp_type, 1);
+    assert_eq!(pos.scale, 4);
+
+    let v = &dl.primitives[0].vertices;
+    let eps = 1.0 / 16.0;
+    for (got, want) in v
+        .iter()
+        .map(|vert| vert.pos)
+        .zip([[0.0, 0.0, 0.0], [1.0, 0.5, -0.25], [-0.75, 0.125, 0.0]])
+    {
+        for axis in 0..3 {
+            assert!(
+                (got[axis] - want[axis]).abs() <= eps,
+                "S8x3 axis {} differs by more than 1 LSB: got {} want {}",
+                axis,
+                got[axis],
+                want[axis]
+            );
+        }
+    }
+}
+
+/// `S16×2` quantized TEX0 — covers the UV path of the quantization
+/// machinery (independent of POS / NRM since the buffer layout is
+/// 2-component there).  exponent=12 covers [0, 8] UV space with 1/4096
+/// LSB precision.
+#[test]
+fn uv_format_s16x2_round_trips_via_attribute_scale() {
     let mut mb = MeshBuilder::new();
     mb.add_position(0.0, 0.0, 0.0);
     mb.add_position(1.0, 0.0, 0.0);
     mb.add_position(0.0, 1.0, 0.0);
+    mb.add_uv(0.0, 0.0);
+    mb.add_uv(1.0, 0.5);
+    mb.add_uv(0.5, 1.0);
+    mb.add_triangle(0, 1, 2);
+    mb.set_uv_format(UvFormat::S16x2 { exponent: 12 });
+    let pobj = mb.build().expect("build with S16x2");
+
+    let dat = round_trip(dat_with_pobj(pobj));
+    let dl = unpack_first_pobj(&dat);
+
+    let tex0 = dl
+        .attributes
+        .iter()
+        .find(|a| a.name == GxAttribName::GX_VA_TEX0)
+        .expect("TEX0 attribute");
+    assert_eq!(tex0.stride, 4);
+    assert_eq!(tex0.comp_type, 3);
+    assert_eq!(tex0.scale, 12);
+
+    let v = &dl.primitives[0].vertices;
+    let eps = 1.0 / 4096.0;
+    for (got, want) in v
+        .iter()
+        .map(|vert| vert.tex0)
+        .zip([[0.0, 0.0], [1.0, 0.5], [0.5, 1.0]])
+    {
+        for axis in 0..2 {
+            assert!(
+                (got[axis] - want[axis]).abs() <= eps,
+                "TEX0 axis {} differs by more than 1 LSB: got {} want {}",
+                axis,
+                got[axis],
+                want[axis]
+            );
+        }
+    }
+}
+
+/// `RGB565` CLR0 — `r5g6b5` bit-packed RGB; alpha is dropped (== 1.0 on
+/// decode).  Channel precision: 1/31 for R/B, 1/63 for G.
+#[test]
+fn color_format_rgb565_round_trips() {
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.0, 0.0);
+    mb.add_position(0.0, 1.0, 0.0);
+    // Pure red / green / blue + full alpha (alpha will be dropped).
     mb.add_color(0xFF, 0x00, 0x00, 0xFF);
     mb.add_color(0x00, 0xFF, 0x00, 0xFF);
     mb.add_color(0x00, 0x00, 0xFF, 0xFF);
     mb.add_triangle(0, 1, 2);
     mb.set_color_format(ColorFormat::Rgb565);
-    let err = mb.build().unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Rgb565") && msg.contains("not yet implemented"),
-        "expected unsupported-format error mentioning Rgb565, got: {}",
-        msg
-    );
+    let pobj = mb.build().expect("build with Rgb565");
+
+    let dat = round_trip(dat_with_pobj(pobj));
+    let dl = unpack_first_pobj(&dat);
+
+    let clr = dl
+        .attributes
+        .iter()
+        .find(|a| a.name == GxAttribName::GX_VA_CLR0)
+        .expect("CLR0 attribute");
+    assert_eq!(clr.stride, 2);
+    assert_eq!(clr.comp_type, 0, "RGB565 = comp_type 0");
+    assert_eq!(clr.comp_count, 0, "RGB = comp_count 0");
+
+    let v = &dl.primitives[0].vertices;
+    // 5-bit channel: highest representable is 31<<3 = 248 / 255 ≈ 0.972.
+    // Sufficient tolerance for "primary color stays the dominant channel".
+    let r_eps = 1.0 / 31.0;
+    let g_eps = 1.0 / 63.0;
+    // Pixel 0: red dominant.
+    assert!(v[0].clr0[0] > 1.0 - r_eps, "red[0]={}", v[0].clr0[0]);
+    assert!(v[0].clr0[1] < r_eps);
+    assert!(v[0].clr0[2] < r_eps);
+    assert!((v[0].clr0[3] - 1.0).abs() < 1e-6, "alpha dropped → 1.0");
+    // Pixel 1: green dominant.
+    assert!(v[1].clr0[0] < g_eps);
+    assert!(v[1].clr0[1] > 1.0 - g_eps);
+    assert!(v[1].clr0[2] < g_eps);
+    // Pixel 2: blue dominant.
+    assert!(v[2].clr0[0] < r_eps);
+    assert!(v[2].clr0[1] < g_eps);
+    assert!(v[2].clr0[2] > 1.0 - r_eps);
+}
+
+/// `RGBA4` CLR0 — top 4 bits per channel.  Channel precision: 1/15.
+#[test]
+fn color_format_rgba4_round_trips() {
+    let mut mb = MeshBuilder::new();
+    mb.add_position(0.0, 0.0, 0.0);
+    mb.add_position(1.0, 0.0, 0.0);
+    mb.add_position(0.0, 1.0, 0.0);
+    mb.add_color(0xFF, 0x00, 0x80, 0xFF);
+    mb.add_color(0x00, 0xFF, 0x00, 0x80);
+    mb.add_color(0x40, 0x40, 0x40, 0x40);
+    mb.add_triangle(0, 1, 2);
+    mb.set_color_format(ColorFormat::Rgba4);
+    let pobj = mb.build().expect("build with Rgba4");
+
+    let dat = round_trip(dat_with_pobj(pobj));
+    let dl = unpack_first_pobj(&dat);
+
+    let clr = dl
+        .attributes
+        .iter()
+        .find(|a| a.name == GxAttribName::GX_VA_CLR0)
+        .expect("CLR0 attribute");
+    assert_eq!(clr.stride, 2);
+    assert_eq!(clr.comp_type, 3);
+    assert_eq!(clr.comp_count, 1);
+
+    // 4-bit channel: decoder formula is `(nibble<<4) / 255` → 1 LSB ≈
+    // 16/255 ≈ 0.063.
+    let eps = 16.0 / 255.0;
+    let want = [
+        [0xFF, 0x00, 0x80, 0xFF],
+        [0x00, 0xFF, 0x00, 0x80],
+        [0x40, 0x40, 0x40, 0x40],
+    ];
+    for (vert, raw) in dl.primitives[0].vertices.iter().zip(want) {
+        for i in 0..4 {
+            let want_f = (raw[i] & 0xF0) as f32 / 255.0;
+            assert!(
+                (vert.clr0[i] - want_f).abs() <= eps,
+                "rgba4 channel {} got {} want {}",
+                i,
+                vert.clr0[i],
+                want_f
+            );
+        }
+    }
 }

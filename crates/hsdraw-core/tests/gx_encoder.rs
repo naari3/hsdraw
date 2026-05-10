@@ -16,9 +16,10 @@
 //! against the original RGBA8 input is below a quality threshold that
 //! all-color blocks satisfy in practice.
 
-use hsdraw_core::gx::GxTexFmt;
+use hsdraw_core::gx::{GxTexFmt, GxTlutFmt};
 use hsdraw_core::gx_image::{
-    decode_image, encode_image, encode_image_with_options, image_size, EncodeOptions,
+    decode_image, encode_image, encode_image_with_options, encode_paletted_image, image_size,
+    EncodeOptions,
 };
 
 /// Build a 4x4 RGBA8 pattern with deterministic per-pixel values.
@@ -344,23 +345,243 @@ fn swap_rb_option_is_a_noop_for_non_rgb5a3() {
 }
 
 #[test]
-fn encode_rejects_unsupported_formats() {
-    let rgba = vec![0u8; 4 * 4 * 4];
-    for fmt in [
-        GxTexFmt::I4,
-        GxTexFmt::I8,
-        GxTexFmt::IA4,
-        GxTexFmt::IA8,
-        GxTexFmt::CI4,
-        GxTexFmt::CI8,
-        GxTexFmt::CI14X2,
-    ] {
+fn encode_rejects_paletted_formats_via_unpaletted_path() {
+    // `encode_image` is the palette-less path; paletted formats (CI4 /
+    // CI8 / CI14X2) need a TLUT and so must go through
+    // `encode_paletted_image` instead.
+    let rgba = vec![0u8; 8 * 8 * 4];
+    for fmt in [GxTexFmt::CI4, GxTexFmt::CI8, GxTexFmt::CI14X2] {
+        let err = encode_image(fmt, 8, 8, &rgba).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            encode_image(fmt, 4, 4, &rgba).is_err(),
-            "format {:?} must reject encode (unsupported)",
-            fmt
+            msg.contains("encode_paletted_image"),
+            "{:?}: expected error to point at encode_paletted_image, got: {}",
+            fmt,
+            msg
         );
     }
+}
+
+// =====================================================================
+// Intensity formats (I4 / I8 / IA4 / IA8) — palette-less paths.
+// Round-trip a uniform-luminance pattern + assert per-channel RMS
+// is within the format's quantization budget.
+// =====================================================================
+
+/// Build a 16x16 RGBA pattern that varies luminance and alpha smoothly
+/// — exercises both luminance quantization (I4 = 4-bit) and alpha
+/// quantization (IA4 / IA8).
+fn pattern_16x16_intensity() -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 * 16 * 4);
+    for y in 0..16u8 {
+        for x in 0..16u8 {
+            let i = ((x as u16 + y as u16) * 8) as u8; // 0..240 step 8
+            let a = (x as u16 * 16) as u8; // 0..240 step 16
+            // Grayscale: r = g = b = i, so luminance == i exactly.
+            out.extend_from_slice(&[i, i, i, a]);
+        }
+    }
+    out
+}
+
+#[test]
+fn i4_round_trip_grayscale() {
+    let src = pattern_16x16_intensity();
+    let enc = encode_image(GxTexFmt::I4, 16, 16, &src).expect("encode I4");
+    assert_eq!(enc.len(), image_size(GxTexFmt::I4, 16, 16));
+    let dec = decode_image(GxTexFmt::I4, 16, 16, &enc, None).expect("decode");
+
+    // I4: 4-bit luminance (alpha is decoded as luminance too).  RMS budget
+    // is one 4-bit step = 255/15 = 17 → ~10 RMS.
+    let rms = channel_rms(&src, &dec);
+    // src has variable alpha; I4 decodes alpha = luminance, so RMS
+    // includes that alpha drift.  Loosened budget reflects this.
+    assert!(rms < 80.0, "I4 grayscale RMS too high: {}", rms);
+}
+
+#[test]
+fn i8_round_trip_grayscale() {
+    let src = pattern_16x16_intensity();
+    let enc = encode_image(GxTexFmt::I8, 16, 16, &src).expect("encode I8");
+    assert_eq!(enc.len(), image_size(GxTexFmt::I8, 16, 16));
+    let dec = decode_image(GxTexFmt::I8, 16, 16, &enc, None).expect("decode");
+
+    // I8: 8-bit luminance is loss-less for grayscale inputs; alpha is
+    // decoded == luminance, so alpha mismatch is the only error source.
+    // For each pixel, want = (i, i, i, a)  got = (i, i, i, i)
+    // so per-channel error = (0, 0, 0, |i - a|).
+    let mut max_err: u32 = 0;
+    for (s, d) in src.chunks_exact(4).zip(dec.chunks_exact(4)) {
+        assert_eq!(s[0], d[0], "I8 R must round-trip");
+        assert_eq!(s[1], d[1]);
+        assert_eq!(s[2], d[2]);
+        let e = (s[3] as i32 - d[3] as i32).unsigned_abs();
+        if e > max_err {
+            max_err = e;
+        }
+    }
+    // alpha was 0..240 step 16, luminance was 0..240 step 8 — max
+    // difference at a given pixel <= 255.
+    assert!(max_err <= 255);
+}
+
+#[test]
+fn ia4_round_trip_with_alpha() {
+    let src = pattern_16x16_intensity();
+    let enc = encode_image(GxTexFmt::IA4, 16, 16, &src).expect("encode IA4");
+    assert_eq!(enc.len(), image_size(GxTexFmt::IA4, 16, 16));
+    let dec = decode_image(GxTexFmt::IA4, 16, 16, &enc, None).expect("decode");
+
+    // IA4: 4-bit i + 4-bit a, decoded as RGB = (i, i, i), A = a.
+    // RMS budget per channel ≈ one 4-bit step = ~17 → ~17 RMS overall.
+    let rms = channel_rms(&src, &dec);
+    assert!(rms < 17.0, "IA4 RMS too high: {}", rms);
+}
+
+#[test]
+fn ia8_round_trip_with_alpha_lossless_for_grayscale() {
+    let src = pattern_16x16_intensity();
+    let enc = encode_image(GxTexFmt::IA8, 16, 16, &src).expect("encode IA8");
+    assert_eq!(enc.len(), image_size(GxTexFmt::IA8, 16, 16));
+    let dec = decode_image(GxTexFmt::IA8, 16, 16, &enc, None).expect("decode");
+
+    // IA8: 8-bit i + 8-bit a, grayscale + arbitrary alpha is fully
+    // lossless.
+    assert_eq!(src, dec, "IA8 grayscale + alpha must round-trip exactly");
+}
+
+// =====================================================================
+// Paletted formats (CI4 / CI8 / CI14X2) — round-trip via TLUT.
+// We build an image whose unique-color count is at or below the
+// palette size, encode + decode, and assert byte equality (after
+// allowing for the TLUT format's own quantization).
+// =====================================================================
+
+/// 16x16 image with at most 8 unique colors — fits CI4 (palette of 16)
+/// without quantization loss when the TLUT format is RGB5A3.
+fn pattern_16x16_palette_friendly() -> Vec<u8> {
+    let palette: [[u8; 4]; 8] = [
+        [0xFF, 0x00, 0x00, 0xFF],
+        [0x00, 0xFF, 0x00, 0xFF],
+        [0x00, 0x00, 0xFF, 0xFF],
+        [0xFF, 0xFF, 0x00, 0xFF],
+        [0x00, 0xFF, 0xFF, 0xFF],
+        [0xFF, 0x00, 0xFF, 0xFF],
+        [0xFF, 0xFF, 0xFF, 0xFF],
+        [0x00, 0x00, 0x00, 0xFF],
+    ];
+    let mut out = Vec::with_capacity(16 * 16 * 4);
+    for y in 0..16 {
+        for x in 0..16 {
+            let c = palette[((x + y) % 8) as usize];
+            out.extend_from_slice(&c);
+        }
+    }
+    out
+}
+
+#[test]
+fn ci4_round_trip_with_unique_palette() {
+    let src = pattern_16x16_palette_friendly();
+    let enc = encode_paletted_image(GxTexFmt::CI4, 16, 16, &src, GxTlutFmt::RGB5A3, None)
+        .expect("encode CI4");
+    assert_eq!(enc.image.len(), image_size(GxTexFmt::CI4, 16, 16));
+    // Palette ≤ 16 entries; here ≤ 8 unique colors so the encoder uses
+    // the unique-fast-path (no median-cut).
+    assert!(enc.palette_rgba.len() <= 16);
+    assert!(enc.palette_rgba.len() >= 8);
+
+    let dec = decode_image(
+        GxTexFmt::CI4,
+        16,
+        16,
+        &enc.image,
+        Some((GxTlutFmt::RGB5A3, &enc.palette_bytes)),
+    )
+    .expect("decode");
+
+    // RGB5A3 quantizes each channel to 5 bits when alpha = 0xFF; the
+    // primary-color palette entries snap exactly because their channel
+    // values (0x00 / 0xFF) are already on the 5-bit grid.
+    assert_eq!(src, dec, "CI4 + RGB5A3 TLUT round-trips byte-exact for primary-color palette");
+}
+
+#[test]
+fn ci8_round_trip_via_median_cut() {
+    // Many distinct colors — forces median-cut quantization, then we
+    // accept lossy round-trip with a generous RMS budget.
+    let mut src = Vec::with_capacity(16 * 16 * 4);
+    for y in 0..16u8 {
+        for x in 0..16u8 {
+            src.extend_from_slice(&[x * 16, y * 16, ((x ^ y) as u8) * 16, 0xFF]);
+        }
+    }
+    let enc = encode_paletted_image(
+        GxTexFmt::CI8,
+        16,
+        16,
+        &src,
+        GxTlutFmt::RGB5A3,
+        Some(64),
+    )
+    .expect("encode CI8");
+    assert_eq!(enc.image.len(), image_size(GxTexFmt::CI8, 16, 16));
+    assert!(enc.palette_rgba.len() <= 64);
+
+    let dec = decode_image(
+        GxTexFmt::CI8,
+        16,
+        16,
+        &enc.image,
+        Some((GxTlutFmt::RGB5A3, &enc.palette_bytes)),
+    )
+    .expect("decode");
+
+    // 64-entry palette + 5-bit channel quantization on a 256-pixel
+    // smoothly-varying image — RMS should stay under ~32 (≈ one 4-bit
+    // step worst case).
+    let rms = channel_rms(&src, &dec);
+    assert!(rms < 32.0, "CI8 RMS too high: {}", rms);
+}
+
+#[test]
+fn ci14x2_round_trip_lossless_for_small_palette() {
+    let src = pattern_16x16_palette_friendly();
+    // 14-bit indexable, but our source has only 8 unique colors — and
+    // RGB5A3 lossless for full-alpha primary colors as above.
+    let enc = encode_paletted_image(GxTexFmt::CI14X2, 16, 16, &src, GxTlutFmt::RGB5A3, None)
+        .expect("encode CI14X2");
+    // CI14X2 stores 2 bytes per indexed pixel (the index is `pixel &
+    // 0x3FFF`).  `image_size` reports the 1-byte-per-pixel figure that
+    // HSDLib uses as a *minimum* — the actual on-wire byte count is
+    // `2 * w_pad * h_pad`.
+    let w_pad = (16u32 + 3) & !3;
+    let h_pad = (16u32 + 3) & !3;
+    assert_eq!(enc.image.len(), (w_pad * h_pad * 2) as usize);
+    let _ = image_size(GxTexFmt::CI14X2, 16, 16);
+
+    let dec = decode_image(
+        GxTexFmt::CI14X2,
+        16,
+        16,
+        &enc.image,
+        Some((GxTlutFmt::RGB5A3, &enc.palette_bytes)),
+    )
+    .expect("decode");
+    assert_eq!(src, dec, "CI14X2 + RGB5A3 TLUT round-trips byte-exact");
+}
+
+#[test]
+fn paletted_rejects_non_paletted_format() {
+    let rgba = vec![0u8; 4 * 4 * 4];
+    let err = encode_paletted_image(GxTexFmt::RGBA8, 4, 4, &rgba, GxTlutFmt::RGB5A3, None)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("CI4 / CI8 / CI14X2"),
+        "expected format-restriction error, got: {}",
+        msg
+    );
 }
 
 #[test]

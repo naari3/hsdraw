@@ -495,13 +495,15 @@ pub fn palette_to_rgba(format: GxTlutFmt, data: &[u8]) -> Vec<u8> {
 
 // =====================================================================
 // GX texture encoders.  Inverse of the per-format decoders above.
-// Tlut / paletted formats (CI4 / CI8 / CI14X2 / I4 / I8 / IA4 / IA8)
-// are intentionally NOT encoded yet — palette quantization
-// (median-cut + nearest-color) plus per-format tile pack is mechanical
-// but non-trivial and has not been a priority for the consumers that
-// drove this library so far.  See `todo.md` §2.8 for the roadmap.
-// Until then, callers with paletted source data have to route through
-// one of the supported unpaletted formats (RGB5A3 / RGB565 / RGBA8).
+//
+// Coverage:
+//   - RGBA8 / RGB565 / RGB5A3 / CMP — `encode_image` (drop in for
+//     the same-named decoders).
+//   - I4 / I8 / IA4 / IA8 — `encode_image` (palette-less intensity
+//     formats; alpha == 1.0 on the I* paths).
+//   - CI4 / CI8 / CI14X2 — `encode_paletted_image` (returns the
+//     `(image_bytes, palette_rgba, tlut_bytes)` triple; median-cut
+//     quantization, nearest-color RGBA index assignment).
 // =====================================================================
 
 /// Per-format encode tweaks.  Default state (`EncodeOptions::default()`)
@@ -570,16 +572,14 @@ pub fn encode_image_with_options(
             }
         }
         GxTexFmt::CMP => to_cmp(rgba, width, height),
-        GxTexFmt::I4
-        | GxTexFmt::I8
-        | GxTexFmt::IA4
-        | GxTexFmt::IA8
-        | GxTexFmt::CI4
-        | GxTexFmt::CI8
-        | GxTexFmt::CI14X2 => {
+        GxTexFmt::I4 => to_i4(rgba, width, height),
+        GxTexFmt::I8 => to_i8(rgba, width, height),
+        GxTexFmt::IA4 => to_ia4(rgba, width, height),
+        GxTexFmt::IA8 => to_ia8(rgba, width, height),
+        GxTexFmt::CI4 | GxTexFmt::CI8 | GxTexFmt::CI14X2 => {
             return Err(HsdError::malformed(
                 0,
-                "encode_image: paletted / intensity formats (I4 / I8 / IA4 / IA8 / CI4 / CI8 / CI14X2) are not yet encodable — see todo.md §2.8 for the roadmap; for now route paletted sources through one of the supported unpaletted formats (RGBA8 / RGB565 / RGB5A3 / CMP)",
+                "encode_image: paletted formats (CI4 / CI8 / CI14X2) need a TLUT — use encode_paletted_image instead",
             ));
         }
         GxTexFmt::Unknown(_) => {
@@ -589,6 +589,112 @@ pub fn encode_image_with_options(
             ));
         }
     })
+}
+
+/// BT.601 luminance: `Y = 0.299*R + 0.587*G + 0.114*B`.  The HSDLib /
+/// csx pipeline doesn't pin a specific formula for the RGBA→I8 path
+/// (the decoder is one-way), so we adopt the standard YUV coefficients.
+#[inline]
+fn luminance_bt601(r: u8, g: u8, b: u8) -> u8 {
+    let y = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    y.round().clamp(0.0, 255.0) as u8
+}
+
+/// Encode I4 (4-bit intensity, no alpha).  Block: 8×8, 32 bytes,
+/// 1 nibble per pixel.  Inverse of [`from_i4`].
+fn to_i4(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(w, 8);
+    let h_pad = pad_up(h, 8);
+    let mut out = vec![0u8; (w_pad * h_pad / 2) as usize];
+    let mut outp = 0usize;
+    for y in (0..h_pad).step_by(8) {
+        for x in (0..w_pad).step_by(8) {
+            for y1 in y..y + 8 {
+                let mut x1 = x;
+                while x1 < x + 8 {
+                    let [r0, g0, b0, _a0] = sample_rgba(rgba, w, h, x1, y1);
+                    let [r1, g1, b1, _a1] = sample_rgba(rgba, w, h, x1 + 1, y1);
+                    let i0 = quantize(luminance_bt601(r0, g0, b0), 15);
+                    let i1 = quantize(luminance_bt601(r1, g1, b1), 15);
+                    // Decoder reads high nibble first (`(pixel >> 4) … & 0x0F`).
+                    out[outp] = (i0 << 4) | i1;
+                    outp += 1;
+                    x1 += 2;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Encode I8 (8-bit intensity, no alpha).  Block: 4×8, 32 bytes,
+/// 1 byte per pixel.  Inverse of [`from_i8`].
+fn to_i8(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(w, 8);
+    let h_pad = pad_up(h, 4);
+    let mut out = vec![0u8; (w_pad * h_pad) as usize];
+    let mut outp = 0usize;
+    for y in (0..h_pad).step_by(4) {
+        for x in (0..w_pad).step_by(8) {
+            for y1 in y..y + 4 {
+                for x1 in x..x + 8 {
+                    let [r, g, b, _a] = sample_rgba(rgba, w, h, x1, y1);
+                    out[outp] = luminance_bt601(r, g, b);
+                    outp += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Encode IA4 (4-bit intensity + 4-bit alpha).  Block: 4×8, 32 bytes,
+/// 1 byte per pixel = low nibble I, high nibble A.  Inverse of
+/// [`from_ia4`].
+fn to_ia4(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(w, 8);
+    let h_pad = pad_up(h, 4);
+    let mut out = vec![0u8; (w_pad * h_pad) as usize];
+    let mut outp = 0usize;
+    for y in (0..h_pad).step_by(4) {
+        for x in (0..w_pad).step_by(8) {
+            for y1 in y..y + 4 {
+                for x1 in x..x + 8 {
+                    let [r, g, b, a] = sample_rgba(rgba, w, h, x1, y1);
+                    let i = quantize(luminance_bt601(r, g, b), 15);
+                    let a4 = quantize(a, 15);
+                    // Decoder: `i = pixel & 0x0F`, `a = pixel >> 4`.
+                    out[outp] = (a4 << 4) | i;
+                    outp += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Encode IA8 (8-bit intensity + 8-bit alpha).  Block: 4×4, 32 bytes,
+/// 2 bytes per pixel BE = (A, I).  Inverse of [`from_ia8`].
+fn to_ia8(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(w, 4);
+    let h_pad = pad_up(h, 4);
+    let mut out = vec![0u8; (w_pad * h_pad * 2) as usize];
+    let mut outp = 0usize;
+    for y in (0..h_pad).step_by(4) {
+        for x in (0..w_pad).step_by(4) {
+            for y1 in y..y + 4 {
+                for x1 in x..x + 4 {
+                    let [r, g, b, a] = sample_rgba(rgba, w, h, x1, y1);
+                    let i = luminance_bt601(r, g, b);
+                    // Decoder: `pixel = u16 BE`, `a = pixel >> 8`, `i = pixel & 0xff`.
+                    out[outp] = a;
+                    out[outp + 1] = i;
+                    outp += 2;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Width padded up to a multiple of `align`.
@@ -670,11 +776,31 @@ fn to_rgb565(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// Inverse of [`from_rgb5a3`].  The 1-bit branch is driven by alpha:
-/// alpha == 0xFF emits the RGB555 form (top bit set, 5/5/5 channels);
-/// any other alpha value emits the RGB4A3 form (top bit clear, 3-bit
-/// alpha + 4/4/4 channels).  Mid-range alpha values quantize via the
-/// same round-half-up formula as RGB565.
+/// Pack one RGBA pixel into the RGB5A3 `u16` per `decode_rgb5a3`'s
+/// inverse.  Alpha == 0xFF emits the RGB555 form (top bit set,
+/// 5/5/5 channels); any other alpha value emits the RGB4A3 form
+/// (top bit clear, 3-bit alpha + 4/4/4 channels).
+#[inline]
+fn encode_rgb5a3_pixel(r: u8, g: u8, b: u8, a: u8) -> u16 {
+    if a == 0xFF {
+        // RGB555: top bit set, no alpha.  Bits 14-10 = "b", 9-5 = "g",
+        // 4-0 = "r" (see `decode_rgb5a3`).
+        let r5 = quantize(r, 31);
+        let g5 = quantize(g, 31);
+        let b5 = quantize(b, 31);
+        (1u16 << 15) | ((b5 as u16) << 10) | ((g5 as u16) << 5) | (r5 as u16)
+    } else {
+        // RGB4A3: top bit clear, 3-bit alpha at 14-12, 4-bit b/g/r at
+        // 11-8 / 7-4 / 3-0.
+        let a3 = quantize(a, 7);
+        let r4 = quantize(r, 15);
+        let g4 = quantize(g, 15);
+        let b4 = quantize(b, 15);
+        ((a3 as u16) << 12) | ((b4 as u16) << 8) | ((g4 as u16) << 4) | (r4 as u16)
+    }
+}
+
+/// Inverse of [`from_rgb5a3`].
 fn to_rgb5a3(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
     let w_pad = pad_up(w, 4);
     let h_pad = pad_up(h, 4);
@@ -685,29 +811,7 @@ fn to_rgb5a3(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
             for y1 in y..y + 4 {
                 for x1 in x..x + 4 {
                     let [r, g, b, a] = sample_rgba(rgba, w, h, x1, y1);
-                    let pixel: u16 = if a == 0xFF {
-                        // RGB555: top bit set, no alpha.  HSDLib labels
-                        // bits 14-10 as "b", 9-5 as "g", 4-0 as "r"
-                        // (see `decode_rgb5a3`).
-                        let r5 = quantize(r, 31);
-                        let g5 = quantize(g, 31);
-                        let b5 = quantize(b, 31);
-                        (1u16 << 15)
-                            | ((b5 as u16) << 10)
-                            | ((g5 as u16) << 5)
-                            | (r5 as u16)
-                    } else {
-                        // RGB4A3: top bit clear, 3-bit alpha at bits
-                        // 14-12, 4-bit b/g/r at 11-8 / 7-4 / 3-0.
-                        let a3 = quantize(a, 7);
-                        let r4 = quantize(r, 15);
-                        let g4 = quantize(g, 15);
-                        let b4 = quantize(b, 15);
-                        ((a3 as u16) << 12)
-                            | ((b4 as u16) << 8)
-                            | ((g4 as u16) << 4)
-                            | (r4 as u16)
-                    };
+                    let pixel = encode_rgb5a3_pixel(r, g, b, a);
                     out[outp..outp + 2].copy_from_slice(&pixel.to_be_bytes());
                     outp += 2;
                 }
@@ -812,6 +916,297 @@ fn to_cmp(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
         }
     }
 
+    out
+}
+
+// =====================================================================
+// Paletted format encoders (CI4 / CI8 / CI14X2) + TLUT packer
+// =====================================================================
+
+/// Output of [`encode_paletted_image`]: the image-side index bytes
+/// (slot in `Image.image_data`), the palette as raw RGBA8 (kept for
+/// caller-side inspection / debugging), and the TLUT-format bytes
+/// (slot in `Tlut.palette_bytes`).
+#[derive(Debug, Clone)]
+pub struct EncodedPaletted {
+    /// GX-format index bytes (CI4 / CI8 / CI14X2 packed per the per-
+    /// format tile layout — same wire shape `decode_image` reads).
+    pub image: Vec<u8>,
+    /// Quantized palette in RGBA8 (one `[u8; 4]` per entry).
+    pub palette_rgba: Vec<[u8; 4]>,
+    /// Palette encoded in the requested `GxTlutFmt` (2 bytes/entry BE).
+    pub palette_bytes: Vec<u8>,
+}
+
+/// Encode `rgba` (length = `4 * width * height`) into a GX paletted
+/// texture.  `format` must be `CI4` / `CI8` / `CI14X2`; other formats
+/// return `HsdError::Malformed`.  `tlut_format` chooses the palette
+/// wire format (`IA8` / `RGB565` / `RGB5A3`).
+///
+/// `max_palette` lets the caller cap the palette size below the format
+/// maximum (16 / 256 / 16384) — useful when targeting a runtime with
+/// stricter TLUT budgets.  `None` uses the format max.
+pub fn encode_paletted_image(
+    format: GxTexFmt,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    tlut_format: GxTlutFmt,
+    max_palette: Option<usize>,
+) -> Result<EncodedPaletted> {
+    if rgba.len() != (width as usize) * (height as usize) * 4 {
+        return Err(HsdError::malformed(
+            0,
+            "encode_paletted_image: RGBA buffer size mismatch",
+        ));
+    }
+    let fmt_max = match format {
+        GxTexFmt::CI4 => 16,
+        GxTexFmt::CI8 => 256,
+        GxTexFmt::CI14X2 => 1 << 14, // 16384
+        _ => {
+            return Err(HsdError::malformed(
+                0,
+                "encode_paletted_image: format must be CI4 / CI8 / CI14X2",
+            ));
+        }
+    };
+    let k = max_palette.map_or(fmt_max, |m| m.min(fmt_max).max(1));
+
+    // Gather pixels.
+    let pixels: Vec<[u8; 4]> = rgba
+        .chunks_exact(4)
+        .map(|c| [c[0], c[1], c[2], c[3]])
+        .collect();
+
+    // Quantize via median-cut.  Fast path when `pixels.len() <= k` and
+    // every entry is unique: use them as-is (no quantization loss).
+    let palette: Vec<[u8; 4]> = {
+        let mut uniq: std::collections::BTreeSet<[u8; 4]> = std::collections::BTreeSet::new();
+        for p in &pixels {
+            uniq.insert(*p);
+            if uniq.len() > k {
+                break;
+            }
+        }
+        if uniq.len() <= k {
+            uniq.into_iter().collect()
+        } else {
+            median_cut(&pixels, k)
+        }
+    };
+
+    // Build the index-per-pixel table.  Use a small cache to avoid the
+    // O(N * K) inner loop blow-up on large images.
+    let mut cache: std::collections::HashMap<[u8; 4], u16> =
+        std::collections::HashMap::with_capacity(palette.len() * 2);
+    let mut indices: Vec<u16> = Vec::with_capacity(pixels.len());
+    for p in &pixels {
+        let idx = *cache
+            .entry(*p)
+            .or_insert_with(|| nearest_palette_index(&palette, *p));
+        indices.push(idx);
+    }
+
+    let image = match format {
+        GxTexFmt::CI4 => pack_ci4(&indices, width, height),
+        GxTexFmt::CI8 => pack_ci8(&indices, width, height),
+        GxTexFmt::CI14X2 => pack_ci14x2(&indices, width, height),
+        _ => unreachable!("format already validated"),
+    };
+
+    let palette_bytes = palette_to_tlut_bytes(&palette, tlut_format);
+
+    Ok(EncodedPaletted {
+        image,
+        palette_rgba: palette,
+        palette_bytes,
+    })
+}
+
+/// Median-cut palette quantization producing up to `k` colors.  Each
+/// bucket is split along its widest channel axis (across all 4 RGBA
+/// channels) until we reach `k` buckets or no bucket has > 1 distinct
+/// pixel.  Each bucket's centroid (channel-mean) becomes one palette
+/// entry.  Empty buckets (= `k > unique colors`) are skipped — the
+/// returned vec may have fewer than `k` entries in that case.
+fn median_cut(pixels: &[[u8; 4]], k: usize) -> Vec<[u8; 4]> {
+    assert!(k >= 1);
+    if pixels.is_empty() {
+        return vec![[0, 0, 0, 0]];
+    }
+    let mut buckets: Vec<Vec<[u8; 4]>> = vec![pixels.to_vec()];
+    while buckets.len() < k {
+        // Find the bucket / axis with the largest channel range.
+        let mut best_idx: Option<usize> = None;
+        let mut best_axis: usize = 0;
+        let mut best_range: u32 = 0;
+        for (i, b) in buckets.iter().enumerate() {
+            if b.len() < 2 {
+                continue;
+            }
+            for axis in 0..4 {
+                let (lo, hi) = b.iter().fold((255u8, 0u8), |(lo, hi), p| {
+                    (lo.min(p[axis]), hi.max(p[axis]))
+                });
+                let range = hi.saturating_sub(lo) as u32;
+                if range > best_range {
+                    best_range = range;
+                    best_idx = Some(i);
+                    best_axis = axis;
+                }
+            }
+        }
+        let Some(idx) = best_idx else { break };
+        let mut bucket = buckets.swap_remove(idx);
+        bucket.sort_by_key(|p| p[best_axis]);
+        let mid = bucket.len() / 2;
+        let upper = bucket.split_off(mid);
+        buckets.push(bucket);
+        buckets.push(upper);
+    }
+    buckets
+        .into_iter()
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            let n = b.len() as u32;
+            let (mut sr, mut sg, mut sb, mut sa) = (0u32, 0u32, 0u32, 0u32);
+            for p in &b {
+                sr += p[0] as u32;
+                sg += p[1] as u32;
+                sb += p[2] as u32;
+                sa += p[3] as u32;
+            }
+            [
+                (sr / n) as u8,
+                (sg / n) as u8,
+                (sb / n) as u8,
+                (sa / n) as u8,
+            ]
+        })
+        .collect()
+}
+
+/// Linear-scan nearest-palette-entry lookup using squared RGBA distance.
+fn nearest_palette_index(palette: &[[u8; 4]], c: [u8; 4]) -> u16 {
+    let mut best: u16 = 0;
+    let mut best_dist: u64 = u64::MAX;
+    for (i, p) in palette.iter().enumerate() {
+        let dr = c[0] as i32 - p[0] as i32;
+        let dg = c[1] as i32 - p[1] as i32;
+        let db = c[2] as i32 - p[2] as i32;
+        let da = c[3] as i32 - p[3] as i32;
+        let d = (dr * dr + dg * dg + db * db + da * da) as u64;
+        if d < best_dist {
+            best_dist = d;
+            best = i as u16;
+        }
+    }
+    best
+}
+
+/// Encode a palette into the wire-format bytes for the given TLUT
+/// format.  Inverse of [`palette_to_rgba`]; each entry is 2 bytes BE.
+fn palette_to_tlut_bytes(palette: &[[u8; 4]], tlut_fmt: GxTlutFmt) -> Vec<u8> {
+    let mut out = Vec::with_capacity(palette.len() * 2);
+    for &[r, g, b, a] in palette {
+        let pixel: u16 = match tlut_fmt {
+            GxTlutFmt::IA8 => {
+                // Decoder: `r = pixel & 0xff`, `a = pixel >> 8`, output
+                // `(r, r, r, a)`.  We encode luminance into the low byte.
+                let i = luminance_bt601(r, g, b);
+                ((a as u16) << 8) | (i as u16)
+            }
+            GxTlutFmt::RGB565 => {
+                // Same bit layout as `to_rgb565`: high 5 = "b", mid 6 = g,
+                // low 5 = "r" (HSDLib quirk).  Alpha dropped.
+                let r5 = quantize(r, 31);
+                let g6 = quantize(g, 63);
+                let b5 = quantize(b, 31);
+                ((b5 as u16) << 11) | ((g6 as u16) << 5) | (r5 as u16)
+            }
+            GxTlutFmt::RGB5A3 => encode_rgb5a3_pixel(r, g, b, a),
+            GxTlutFmt::Unknown(_) => 0,
+        };
+        out.extend_from_slice(&pixel.to_be_bytes());
+    }
+    out
+}
+
+/// Read an index from `indices` at `(x, y)` or return 0 for out-of-
+/// bounds (tile-padding case).
+#[inline]
+fn sample_index(indices: &[u16], w: u32, h: u32, x: u32, y: u32) -> u16 {
+    if x < w && y < h {
+        indices[(y * w + x) as usize]
+    } else {
+        0
+    }
+}
+
+/// Inverse of [`from_ci4`].  Block: 8×8, 32 bytes, 1 nibble per pixel
+/// (high nibble first per byte, matching `from_ci4`'s
+/// `(pixel >> 4) & 0x0F` / `pixel & 0x0F` reads).
+fn pack_ci4(indices: &[u16], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(w, 8);
+    let h_pad = pad_up(h, 8);
+    let mut out = vec![0u8; (w_pad * h_pad / 2) as usize];
+    let mut outp = 0usize;
+    for y in (0..h_pad).step_by(8) {
+        for x in (0..w_pad).step_by(8) {
+            for y1 in y..y + 8 {
+                let mut x1 = x;
+                while x1 < x + 8 {
+                    let i0 = (sample_index(indices, w, h, x1, y1) & 0x0F) as u8;
+                    let i1 = (sample_index(indices, w, h, x1 + 1, y1) & 0x0F) as u8;
+                    out[outp] = (i0 << 4) | i1;
+                    outp += 1;
+                    x1 += 2;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`from_ci8`].  Block: 4×8, 32 bytes, 1 byte per pixel.
+fn pack_ci8(indices: &[u16], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(w, 8);
+    let h_pad = pad_up(h, 4);
+    let mut out = vec![0u8; (w_pad * h_pad) as usize];
+    let mut outp = 0usize;
+    for y in (0..h_pad).step_by(4) {
+        for x in (0..w_pad).step_by(8) {
+            for y1 in y..y + 4 {
+                for x1 in x..x + 8 {
+                    let v = (sample_index(indices, w, h, x1, y1) & 0xFF) as u8;
+                    out[outp] = v;
+                    outp += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`from_ci14x2`].  Block: 4×4, 32 bytes, 2 bytes per pixel
+/// BE — low 14 bits = index, top 2 bits zero.
+fn pack_ci14x2(indices: &[u16], w: u32, h: u32) -> Vec<u8> {
+    let w_pad = pad_up(w, 4);
+    let h_pad = pad_up(h, 4);
+    let mut out = vec![0u8; (w_pad * h_pad * 2) as usize];
+    let mut outp = 0usize;
+    for y in (0..h_pad).step_by(4) {
+        for x in (0..w_pad).step_by(4) {
+            for y1 in y..y + 4 {
+                for x1 in x..x + 4 {
+                    let v = sample_index(indices, w, h, x1, y1) & 0x3FFF;
+                    out[outp..outp + 2].copy_from_slice(&v.to_be_bytes());
+                    outp += 2;
+                }
+            }
+        }
+    }
     out
 }
 

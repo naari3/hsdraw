@@ -16,8 +16,8 @@ side mesh data, and serialize back — all without depending on
 | **Writer** | HSDLib `Save`-compatible: struct identity dedup, FNV-1a buffer hash dedup, ref-chain key=0 skip, alias-root round-trip across the 9-file corpus |
 | **csx parity** | semantic JSON diff (ε = 1e-5) + PNG pixel-equal across 6 vanilla MKGP2 courses (`test_course_start_gate`, `MR_highway_short_A` & `_long_A`, `DK_jungle_short_a` & `_long_a`, `AT_demo`) |
 | **Mutation API** | HSDLib-equivalent allocation + setter primitives — see [details below](#mutation-primitives) |
-| **From-scratch synthesis** | `Dat::alloc_scene_data_minimal(root_name)` factory + TObj / Image allocators + `gx_image::encode_image` (RGBA8 / RGB565 / RGB5A3 / CMP) — produce a self-contained .dat with no base file |
-| **POBJ writer** | `MeshBuilder` (positions / normals / colors / UVs / triangles / envelopes) → `Pobj`; greedy `TRIANGLE_STRIP` decomposition (toggleable, on by default), envelope rigging |
+| **From-scratch synthesis** | `Dat::alloc_scene_data_minimal(root_name)` factory + TObj / Image allocators + `gx_image::encode_image` (RGBA8 / RGB565 / RGB5A3 / CMP / I4 / I8 / IA4 / IA8) + `gx_image::encode_paletted_image` (CI4 / CI8 / CI14X2 with median-cut quantization + TLUT pack) — produce a self-contained .dat with no base file |
+| **POBJ writer** | `MeshBuilder` (positions / normals / colors / UVs / triangles / envelopes) → `Pobj`; greedy `TRIANGLE_STRIP` decomposition (toggleable, on by default), envelope rigging.  Per-attribute format is selectable via `set_{pos,normal,color,uv}_format`: POS / NRM `F32x3 / S16x3 / S8x3` (with quantization exponent), CLR0 `Rgba8 / Rgb565 / Rgba4`, TEX0 `F32x2 / S16x2 / S8x2` |
 | **PyO3** | abi3-py37 wheel covers Python 3.7+; identity-aware `__eq__` / `__hash__` on every typed view |
 | **CI** | `cargo test` on Linux / macOS / Windows + 5-platform abi3 wheel matrix via maturin |
 

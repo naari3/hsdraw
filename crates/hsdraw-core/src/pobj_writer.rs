@@ -38,20 +38,14 @@ use crate::hsd_struct::{HsdStruct, StructRef};
 // Attribute format selection
 //
 // HSDLib's `GX_Attribute` carries (CompCnt, CompType, Scale, Stride) per
-// attribute slot.  The Phase 1–3 writer hard-coded a single combination
+// attribute slot.  The original writer hard-coded a single combination
 // per attribute name: POS / NRM = `F32×3`, CLR0 = `RGBA8`, TEX0 = `F32×2`,
 // `GX_INDEX16` everywhere.  These format enums let callers choose a
 // different combination per build to match what a given downstream
 // renderer expects (e.g. quantized S16 positions for an asset whose
-// vertex budget has to fit a paletted-DL byte limit).
-//
-// Implementation status:
-//   - `F32x3` / `Rgba8` / `F32x2` — fully implemented (= current behavior).
-//   - Quantized variants (`S16x3`, `S8x3`, `U16x3`, `U8x3`, `Rgb565`,
-//     `Rgba4`, …) — enum slots are reserved here so the API is open;
-//     the writer returns `MeshBuilder::build` errors for these until the
-//     per-format encoders land.  See `todo.md` §2.7 for the rollout
-//     plan + the per-format CompType / Scale matrix.
+// vertex budget has to fit a smaller GX FIFO).  Quantized variants
+// store `value × (1 << exponent)` as a signed integer and round-trip
+// through `gx_dl::decode_data_at`'s `raw / (1 << scale)` step.
 // =====================================================================
 
 /// Per-attribute layout choice for `GX_VA_POS`.
@@ -60,11 +54,14 @@ pub enum PosFormat {
     /// 32-bit IEEE float ×3, no scale.  `CompType = Float (4)`,
     /// `CompCnt = PosXYZ (1)`, `Stride = 12`.
     F32x3,
-    /// `S16×3` quantized.  Decode multiplier is `2^-exponent`.
-    /// **Not yet implemented in the writer** — placeholder.
+    /// `S16×3` quantized.  Each component is encoded as
+    /// `round(value × (1 << exponent))` clamped to `i16` range; decode
+    /// multiplier on read is `1 / (1 << exponent)`.  `CompType = Int16
+    /// (3)`, `CompCnt = PosXYZ (1)`, `Stride = 6`, `Scale = exponent`.
     S16x3 { exponent: u8 },
-    /// `S8×3` quantized.  Decode multiplier is `2^-exponent`.
-    /// **Not yet implemented in the writer** — placeholder.
+    /// `S8×3` quantized.  Same scheme as `S16x3` but `i8` per component.
+    /// `CompType = Int8 (1)`, `CompCnt = PosXYZ (1)`, `Stride = 3`,
+    /// `Scale = exponent`.
     S8x3 { exponent: u8 },
 }
 
@@ -74,11 +71,12 @@ pub enum NormalFormat {
     /// 32-bit IEEE float ×3, no scale.  `CompType = Float (4)`,
     /// `CompCnt = NrmXYZ (0)`, `Stride = 12`.
     F32x3,
-    /// `S16×3` quantized.  Decode multiplier is `2^-exponent`.
-    /// **Not yet implemented in the writer** — placeholder.
+    /// `S16×3` quantized; see [`PosFormat::S16x3`] for the quantization
+    /// model.  `CompType = Int16 (3)`, `CompCnt = NrmXYZ (0)`,
+    /// `Stride = 6`, `Scale = exponent`.
     S16x3 { exponent: u8 },
-    /// `S8×3` quantized.  Decode multiplier is `2^-exponent`.
-    /// **Not yet implemented in the writer** — placeholder.
+    /// `S8×3` quantized; see [`PosFormat::S8x3`].  `CompType = Int8 (1)`,
+    /// `CompCnt = NrmXYZ (0)`, `Stride = 3`, `Scale = exponent`.
     S8x3 { exponent: u8 },
 }
 
@@ -89,9 +87,15 @@ pub enum ColorFormat {
     /// `RGBA8` 4-byte per vertex.  `CompType = RGBA8 (5)`,
     /// `CompCnt = ClrRGBA (1)`, `Stride = 4`.
     Rgba8,
-    /// `RGB565` 2-byte per vertex.  **Not yet implemented in the writer**.
+    /// `RGB565` 2-byte per vertex.  Bit layout matches the HSDLib
+    /// quirk seen in `gx_dl::decode_color_at`: red in low 5 bits, green
+    /// in middle 6 bits, blue in high 5 bits.  Alpha is dropped (always
+    /// 1.0 on decode).  `CompType = RGB565 (0)`, `CompCnt = ClrRGB (0)`,
+    /// `Stride = 2`.
     Rgb565,
-    /// `RGBA4` 2-byte per vertex.  **Not yet implemented in the writer**.
+    /// `RGBA4` 2-byte per vertex.  Each channel is the top 4 bits of
+    /// the source `u8`.  `CompType = RGBA4 (3)`, `CompCnt = ClrRGBA
+    /// (1)`, `Stride = 2`.
     Rgba4,
 }
 
@@ -101,11 +105,12 @@ pub enum UvFormat {
     /// 32-bit IEEE float ×2, no scale.  `CompType = Float (4)`,
     /// `CompCnt = TexST (1)`, `Stride = 8`.
     F32x2,
-    /// `S16×2` quantized.  Decode multiplier is `2^-exponent`.
-    /// **Not yet implemented in the writer** — placeholder.
+    /// `S16×2` quantized; see [`PosFormat::S16x3`] for the quantization
+    /// model.  `CompType = Int16 (3)`, `CompCnt = TexST (1)`,
+    /// `Stride = 4`, `Scale = exponent`.
     S16x2 { exponent: u8 },
-    /// `S8×2` quantized.  Decode multiplier is `2^-exponent`.
-    /// **Not yet implemented in the writer** — placeholder.
+    /// `S8×2` quantized; see [`PosFormat::S8x3`].  `CompType = Int8 (1)`,
+    /// `CompCnt = TexST (1)`, `Stride = 2`, `Scale = exponent`.
     S8x2 { exponent: u8 },
 }
 
@@ -333,28 +338,29 @@ impl MeshBuilder {
     }
 
     /// Choose the on-disk format for `GX_VA_POS`.  Default is
-    /// `PosFormat::F32x3` (= the pre-Phase-7 behavior).  Non-`F32x3`
-    /// variants are currently placeholders; `build()` returns an error
-    /// for them until the per-format encoders land — see
-    /// `todo.md` §2.7.
+    /// `PosFormat::F32x3` (= the original hard-coded behavior).
+    /// Quantized variants `S16x3` / `S8x3` use `value × (1 << exponent)`
+    /// rounded to signed-integer range; the GX `Scale` field is set so
+    /// `gx_dl::decode_data_at` reads the original value back via
+    /// `raw / (1 << scale)`.
     pub fn set_pos_format(&mut self, fmt: PosFormat) {
         self.pos_format = fmt;
     }
     /// Choose the on-disk format for `GX_VA_NRM`.  Default is
     /// `NormalFormat::F32x3`.  See [`Self::set_pos_format`] for the
-    /// caveat on placeholder variants.
+    /// quantization model.
     pub fn set_normal_format(&mut self, fmt: NormalFormat) {
         self.normal_format = fmt;
     }
     /// Choose the on-disk format for `GX_VA_CLR0`.  Default is
-    /// `ColorFormat::Rgba8`.  See [`Self::set_pos_format`] for the
-    /// caveat on placeholder variants.
+    /// `ColorFormat::Rgba8`.  See [`ColorFormat`] for the per-variant
+    /// bit layout.
     pub fn set_color_format(&mut self, fmt: ColorFormat) {
         self.color_format = fmt;
     }
     /// Choose the on-disk format for `GX_VA_TEX0`.  Default is
     /// `UvFormat::F32x2`.  See [`Self::set_pos_format`] for the
-    /// caveat on placeholder variants.
+    /// quantization model used by the `S*x2` variants.
     pub fn set_uv_format(&mut self, fmt: UvFormat) {
         self.uv_format = fmt;
     }
@@ -534,22 +540,24 @@ impl MeshBuilder {
                 kind: GxAttribType::GX_DIRECT,
                 comp_count: 0,
                 comp_type: 0,
+                scale: 0,
                 stride: 0,
                 buffer: None,
             });
         }
 
         // POS / NRM / CLR0 / TEX0 attribute records.  CompCnt /
-        // CompType / Stride come from each attribute's `AttrLayout` —
-        // the format-aware encoders above produced both the byte buffer
-        // and the layout triple as one operation, so the AttrSpec rows
-        // below stay symmetric across F32 and (future) quantized
-        // formats.
+        // CompType / Scale / Stride come from each attribute's
+        // `AttrLayout` — the format-aware encoders above produced
+        // both the byte buffer and the layout quadruple as one
+        // operation, so the AttrSpec rows below stay symmetric across
+        // F32 and quantized formats.
         attrs.push(AttrSpec {
             name: GxAttribName::GX_VA_POS,
             kind: GxAttribType::GX_INDEX16,
             comp_count: pos_layout.comp_count,
             comp_type: pos_layout.comp_type,
+            scale: pos_layout.scale,
             stride: pos_layout.stride,
             buffer: Some(pos_ref),
         });
@@ -560,6 +568,7 @@ impl MeshBuilder {
                 kind: GxAttribType::GX_INDEX16,
                 comp_count: layout.comp_count,
                 comp_type: layout.comp_type,
+                scale: layout.scale,
                 stride: layout.stride,
                 buffer: Some(b),
             });
@@ -571,6 +580,7 @@ impl MeshBuilder {
                 kind: GxAttribType::GX_INDEX16,
                 comp_count: layout.comp_count,
                 comp_type: layout.comp_type,
+                scale: layout.scale,
                 stride: layout.stride,
                 buffer: Some(b),
             });
@@ -582,6 +592,7 @@ impl MeshBuilder {
                 kind: GxAttribType::GX_INDEX16,
                 comp_count: layout.comp_count,
                 comp_type: layout.comp_type,
+                scale: layout.scale,
                 stride: layout.stride,
                 buffer: Some(b),
             });
@@ -598,7 +609,11 @@ impl MeshBuilder {
                 s.set_u32(off + 0x04, a.kind.into())?;
                 s.set_u32(off + 0x08, a.comp_count)?;
                 s.set_u32(off + 0x0C, a.comp_type)?;
-                // 0x10: scale (u8) = 0; 0x11: padding = 0
+                // 0x10: scale (u8) — quantization exponent for the
+                // integer-fixed-point formats (decode pass divides by
+                // `1 << scale`).  Stays 0 for F32 / DIRECT attrs.
+                // 0x11: padding (zero-init).
+                s.set_u8(off + 0x10, a.scale)?;
                 s.set_u16(off + 0x12, a.stride)?;
                 // 0x14: per-attribute buffer ref; absent for GX_DIRECT
                 // (PNMTXIDX) where the value lives inline in the DL.
@@ -693,6 +708,10 @@ struct AttrSpec {
     kind: GxAttribType,
     comp_count: u32,
     comp_type: u32,
+    /// `n` in HSDLib's `value / (1 << n)` decode pass.  0 for F32 (no
+    /// scaling) and DIRECT attributes; quantization exponent for the
+    /// integer-fixed-point paths.
+    scale: u8,
     /// Stride bytes per indexed entry (matches HSDLib `GX_Attribute.Stride`).
     /// 0 for DIRECT attributes (no buffer).
     stride: u16,
@@ -703,24 +722,19 @@ struct AttrSpec {
 }
 
 /// Per-attribute table record fields that the writer needs to emit
-/// alongside the byte buffer: `CompCnt` / `CompType` / `Stride`.  The
-/// format-aware encoders below return this struct paired with the
+/// alongside the byte buffer: `CompCnt` / `CompType` / `Scale` / `Stride`.
+/// The format-aware encoders below return this struct paired with the
 /// payload bytes so `build()` can drop both into one `AttrSpec`.
+///
+/// `scale` is the `n` in HSDLib's `value / (1 << n)` decode pass —
+/// 0 for F32 paths (no scaling), the quantization exponent for the
+/// integer-fixed-point paths.
 #[derive(Debug, Clone, Copy)]
 struct AttrLayout {
     comp_count: u32,
     comp_type: u32,
+    scale: u8,
     stride: u16,
-}
-
-fn unsupported_format_err(attr: &str, fmt: &str) -> HsdError {
-    HsdError::malformed(
-        0,
-        format!(
-            "MeshBuilder::build: {} format {} is not yet implemented in writer (todo.md §2.7)",
-            attr, fmt
-        ),
-    )
 }
 
 /// Flatten an iterator of f32 slices into a big-endian byte buffer.
@@ -737,41 +751,110 @@ where
     out
 }
 
+/// Encode a flat iterator of f32 values into BE `i16` bytes, scaled by
+/// `1 << exponent`.  Out-of-range values are clamped to `[i16::MIN,
+/// i16::MAX]`.  This is the inverse of `decode_data_at`'s
+/// `i16_value / (1 << scale)` step (see `gx_dl.rs`).
+fn encode_s16_quantized<'a, I>(items: I, exponent: u8) -> Vec<u8>
+where
+    I: IntoIterator<Item = &'a f32>,
+{
+    let scale = (1u32 << exponent) as f32;
+    let mut out = Vec::new();
+    for &v in items {
+        let scaled = (v * scale).round();
+        let q = scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        out.extend_from_slice(&q.to_be_bytes());
+    }
+    out
+}
+
+/// Same as [`encode_s16_quantized`] but `i8` per component.
+fn encode_s8_quantized<'a, I>(items: I, exponent: u8) -> Vec<u8>
+where
+    I: IntoIterator<Item = &'a f32>,
+{
+    let scale = (1u32 << exponent) as f32;
+    let mut out = Vec::new();
+    for &v in items {
+        let scaled = (v * scale).round();
+        let q = scaled.clamp(i8::MIN as f32, i8::MAX as f32) as i8;
+        out.push(q as u8);
+    }
+    out
+}
+
 fn encode_pos(positions: &[[f32; 3]], fmt: PosFormat) -> Result<(Vec<u8>, AttrLayout)> {
     match fmt {
-        // CompCnt=PosXYZ(1), CompType=Float(4), Stride=12.
+        // CompCnt=PosXYZ(1), CompType=Float(4), Stride=12, Scale=0.
         PosFormat::F32x3 => Ok((
             encode_f32_buffer(positions.iter().map(|p| p.as_slice())),
             AttrLayout {
                 comp_count: 1,
                 comp_type: GxCompType::Float.into(),
+                scale: 0,
                 stride: 12,
             },
         )),
-        PosFormat::S16x3 { .. } => Err(unsupported_format_err("POS", "S16x3")),
-        PosFormat::S8x3 { .. } => Err(unsupported_format_err("POS", "S8x3")),
+        // CompCnt=PosXYZ(1), CompType=Int16(3), Stride=6.
+        PosFormat::S16x3 { exponent } => Ok((
+            encode_s16_quantized(positions.iter().flatten(), exponent),
+            AttrLayout {
+                comp_count: 1,
+                comp_type: GxCompType::Int16.into(),
+                scale: exponent,
+                stride: 6,
+            },
+        )),
+        // CompCnt=PosXYZ(1), CompType=Int8(1), Stride=3.
+        PosFormat::S8x3 { exponent } => Ok((
+            encode_s8_quantized(positions.iter().flatten(), exponent),
+            AttrLayout {
+                comp_count: 1,
+                comp_type: GxCompType::Int8.into(),
+                scale: exponent,
+                stride: 3,
+            },
+        )),
     }
 }
 
 fn encode_normal(normals: &[[f32; 3]], fmt: NormalFormat) -> Result<(Vec<u8>, AttrLayout)> {
     match fmt {
-        // CompCnt=NrmXYZ(0), CompType=Float(4), Stride=12.
+        // CompCnt=NrmXYZ(0), CompType=Float(4), Stride=12, Scale=0.
         NormalFormat::F32x3 => Ok((
             encode_f32_buffer(normals.iter().map(|p| p.as_slice())),
             AttrLayout {
                 comp_count: 0,
                 comp_type: GxCompType::Float.into(),
+                scale: 0,
                 stride: 12,
             },
         )),
-        NormalFormat::S16x3 { .. } => Err(unsupported_format_err("NRM", "S16x3")),
-        NormalFormat::S8x3 { .. } => Err(unsupported_format_err("NRM", "S8x3")),
+        NormalFormat::S16x3 { exponent } => Ok((
+            encode_s16_quantized(normals.iter().flatten(), exponent),
+            AttrLayout {
+                comp_count: 0,
+                comp_type: GxCompType::Int16.into(),
+                scale: exponent,
+                stride: 6,
+            },
+        )),
+        NormalFormat::S8x3 { exponent } => Ok((
+            encode_s8_quantized(normals.iter().flatten(), exponent),
+            AttrLayout {
+                comp_count: 0,
+                comp_type: GxCompType::Int8.into(),
+                scale: exponent,
+                stride: 3,
+            },
+        )),
     }
 }
 
 fn encode_color(colors: &[[u8; 4]], fmt: ColorFormat) -> Result<(Vec<u8>, AttrLayout)> {
     match fmt {
-        // CompCnt=ClrRGBA(1), CompType=RGBA8(5), Stride=4.
+        // CompCnt=ClrRGBA(1), CompType=RGBA8(5), Scale=0, Stride=4.
         ColorFormat::Rgba8 => {
             let mut buf = Vec::with_capacity(colors.len() * 4);
             for c in colors {
@@ -782,28 +865,91 @@ fn encode_color(colors: &[[u8; 4]], fmt: ColorFormat) -> Result<(Vec<u8>, AttrLa
                 AttrLayout {
                     comp_count: 1,
                     comp_type: 5,
+                    scale: 0,
                     stride: 4,
                 },
             ))
         }
-        ColorFormat::Rgb565 => Err(unsupported_format_err("CLR0", "Rgb565")),
-        ColorFormat::Rgba4 => Err(unsupported_format_err("CLR0", "Rgba4")),
+        // CompCnt=ClrRGB(0), CompType=RGB565(0), Scale=0, Stride=2.
+        // Bit layout matches `gx_dl::decode_color_at`'s RGB565 arm:
+        // r in low 5 bits, g in middle 6, b in high 5 (= the image-
+        // path RGB565 encoder's "HSDLib quirk" layout).
+        ColorFormat::Rgb565 => {
+            let mut buf = Vec::with_capacity(colors.len() * 2);
+            for [r, g, b, _a] in colors {
+                let r5 = (*r >> 3) as u16;
+                let g6 = (*g >> 2) as u16;
+                let b5 = (*b >> 3) as u16;
+                let pixel: u16 = (b5 << 11) | (g6 << 5) | r5;
+                buf.extend_from_slice(&pixel.to_be_bytes());
+            }
+            Ok((
+                buf,
+                AttrLayout {
+                    comp_count: 0,
+                    comp_type: 0,
+                    scale: 0,
+                    stride: 2,
+                },
+            ))
+        }
+        // CompCnt=ClrRGBA(1), CompType=RGBA4(3), Scale=0, Stride=2.
+        // Byte 0 = (R<<4 | G), byte 1 = (B<<4 | A), each nibble being
+        // the high 4 bits of the u8 channel — mirrors `decode_color_at`'s
+        // RGBA4 arm.
+        ColorFormat::Rgba4 => {
+            let mut buf = Vec::with_capacity(colors.len() * 2);
+            for [r, g, b, a] in colors {
+                let r4 = (*r >> 4) & 0x0F;
+                let g4 = (*g >> 4) & 0x0F;
+                let b4 = (*b >> 4) & 0x0F;
+                let a4 = (*a >> 4) & 0x0F;
+                buf.push((r4 << 4) | g4);
+                buf.push((b4 << 4) | a4);
+            }
+            Ok((
+                buf,
+                AttrLayout {
+                    comp_count: 1,
+                    comp_type: 3,
+                    scale: 0,
+                    stride: 2,
+                },
+            ))
+        }
     }
 }
 
 fn encode_uv(uvs: &[[f32; 2]], fmt: UvFormat) -> Result<(Vec<u8>, AttrLayout)> {
     match fmt {
-        // CompCnt=TexST(1), CompType=Float(4), Stride=8.
+        // CompCnt=TexST(1), CompType=Float(4), Scale=0, Stride=8.
         UvFormat::F32x2 => Ok((
             encode_f32_buffer(uvs.iter().map(|p| p.as_slice())),
             AttrLayout {
                 comp_count: 1,
                 comp_type: GxCompType::Float.into(),
+                scale: 0,
                 stride: 8,
             },
         )),
-        UvFormat::S16x2 { .. } => Err(unsupported_format_err("TEX0", "S16x2")),
-        UvFormat::S8x2 { .. } => Err(unsupported_format_err("TEX0", "S8x2")),
+        UvFormat::S16x2 { exponent } => Ok((
+            encode_s16_quantized(uvs.iter().flatten(), exponent),
+            AttrLayout {
+                comp_count: 1,
+                comp_type: GxCompType::Int16.into(),
+                scale: exponent,
+                stride: 4,
+            },
+        )),
+        UvFormat::S8x2 { exponent } => Ok((
+            encode_s8_quantized(uvs.iter().flatten(), exponent),
+            AttrLayout {
+                comp_count: 1,
+                comp_type: GxCompType::Int8.into(),
+                scale: exponent,
+                stride: 2,
+            },
+        )),
     }
 }
 

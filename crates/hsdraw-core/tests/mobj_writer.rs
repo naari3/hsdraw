@@ -4,12 +4,12 @@
 
 use hsdraw_core::accessor::Accessor;
 use hsdraw_core::common::{
-    DObj, Image, JObj, MObj, Material, PeDesc, SObj, TObj,
+    DObj, Image, JObj, Lod, MObj, Material, PeDesc, SObj, TObj,
 };
 use hsdraw_core::dat::{Dat, RootNode};
 use hsdraw_core::gx::{
-    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexGenSrc, GxTexMapId, GxWrapMode,
-    MaterialRenderMode, TObjFlags,
+    AlphaMap, ColorMap, CoordType, GxAnisotropy, GxTexFilter, GxTexFmt, GxTexGenSrc, GxTexMapId,
+    GxWrapMode, MaterialRenderMode, TObjFlags,
 };
 use hsdraw_core::hsd_struct::HsdStruct;
 
@@ -250,6 +250,63 @@ fn tobj_tex_gen_src_round_trips() {
     let dat = round_trip(dat_with_mobj(mobj));
     let tobj2 = extract_first_mobj(&dat).textures().unwrap();
     assert_eq!(tobj2.tex_gen_src().unwrap(), GxTexGenSrc::GX_TG_TEX0);
+}
+
+#[test]
+fn tobj_lod_round_trips() {
+    // HSD_TOBJ_LOD layout (BE, TrimmedSize 0x10):
+    //   0x00 i32 MinFilter
+    //   0x04 f32 Bias
+    //   0x08 u8  BiasClamp
+    //   0x09 u8  EnableEdgeLOD
+    //   0x0A i32 Anisotropy   (byte-unaligned!)
+    // Drive every field through writer round-trip and verify each
+    // returns the exact same value, including the unaligned i32.
+    let mobj = MObj::allocate_default();
+    let tobj = TObj::allocate_default();
+    tobj.set_tex_map_id(GxTexMapId::GX_TEXMAP0).unwrap();
+    tobj.set_scale(1.0, 1.0, 1.0).unwrap();
+    let img = Image::allocate_default();
+    img.set_width(4).unwrap();
+    img.set_height(4).unwrap();
+    img.set_format(GxTexFmt::RGB565).unwrap();
+    img.set_image_data_bytes(vec![0u8; 32]);
+    tobj.set_image_data(Some(img));
+
+    let lod = Lod::allocate_default();
+    lod.set_min_filter(GxTexFilter::GX_LIN_MIP_LIN).unwrap();
+    lod.set_bias(-1.5).unwrap();
+    lod.set_bias_clamp(true).unwrap();
+    lod.set_enable_edge_lod(true).unwrap();
+    lod.set_anisotropy(GxAnisotropy::GX_MAX_ANISOTROPY).unwrap();
+    tobj.set_lod_data(Some(lod));
+
+    mobj.set_textures(Some(tobj));
+
+    let dat = round_trip(dat_with_mobj(mobj));
+    let tobj2 = extract_first_mobj(&dat).textures().unwrap();
+    let lod2 = tobj2.lod_data().expect("LOD attached after round-trip");
+    assert_eq!(lod2.min_filter().unwrap(), GxTexFilter::GX_LIN_MIP_LIN);
+    assert_eq!(lod2.bias().unwrap(), -1.5);
+    assert!(lod2.bias_clamp().unwrap());
+    assert!(lod2.enable_edge_lod().unwrap());
+    assert_eq!(lod2.anisotropy().unwrap(), GxAnisotropy::GX_MAX_ANISOTROPY);
+}
+
+#[test]
+fn tobj_lod_default_is_0x10_zero() {
+    // `Lod::allocate_default` must produce a 0x10-byte all-zero struct
+    // — i.e. MinFilter=GX_NEAR, Bias=0, BiasClamp=false,
+    // EnableEdgeLOD=false, Anisotropy=GX_ANISO_1.  Pin that contract so
+    // a reader looking at a default-allocated LOD doesn't see leftover
+    // bytes.
+    let lod = Lod::allocate_default();
+    assert_eq!(lod.0.borrow().len(), 0x10);
+    assert_eq!(lod.min_filter().unwrap(), GxTexFilter::GX_NEAR);
+    assert_eq!(lod.bias().unwrap(), 0.0);
+    assert!(!lod.bias_clamp().unwrap());
+    assert!(!lod.enable_edge_lod().unwrap());
+    assert_eq!(lod.anisotropy().unwrap(), GxAnisotropy::GX_ANISO_1);
 }
 
 #[test]

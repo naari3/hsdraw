@@ -296,6 +296,13 @@ plain_enum!(GxTexFilter, u32, {
     GX_LIN_MIP_LIN = 5,
 });
 
+plain_enum!(GxAnisotropy, u32, {
+    GX_ANISO_1 = 0,
+    GX_ANISO_2 = 1,
+    GX_ANISO_4 = 2,
+    GX_MAX_ANISOTROPY = 3,
+});
+
 plain_enum!(CoordType, u32, {
     UV = 0,
     REFLECTION = 1,

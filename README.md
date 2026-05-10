@@ -21,9 +21,9 @@ side mesh data, and serialize back — all without depending on
 | **PyO3** | abi3-py37 wheel covers Python 3.7+; identity-aware `__eq__` / `__hash__` on every typed view |
 | **CI** | `cargo test` on Linux / macOS / Windows + 5-platform abi3 wheel matrix via maturin |
 
-Test totals: **78 passing** env-free (20 unit + 12 mutation primitive +
-4 parity + 15 POBJ writer round-trip + 12 MObj / Material / PeDesc /
-TObj / Image round-trip + 13 GX texture encoder + 2 from-scratch
+Test totals: **80 passing** env-free (20 unit + 12 mutation primitive +
+4 parity + 15 POBJ writer round-trip + 14 MObj / Material / PeDesc /
+TObj / Image / Lod round-trip + 13 GX texture encoder + 2 from-scratch
 chain).  With `MKGP2_FILES_DIR` + `MKGP2_PATCH_DIR` set, an additional
 6 csx-parity courses + 9-file writer round-trip corpus run.
 
@@ -39,7 +39,8 @@ chain).  With `MKGP2_FILES_DIR` + `MKGP2_PATCH_DIR` set, an additional
 | `PeDesc` | `alloc`, `blend_mode`, `src_factor`, `dst_factor`, `depth_function`, `alpha_*`, … |
 | `SObj` | `alloc`, `jobj_descs`, `set_jobj_descs`, `jobj_descs_array` |
 | `JObjDesc` | `alloc`, `root_joint`, `set_root_joint` |
-| `TObj` | `alloc`, `set_tex_map_id`, `set_rotation` / `set_scale` / `set_translation`, `set_wrap_s` / `_t`, `set_repeat_*`, `set_flags` + nibble setters (`coord_type` / `color_op` / `alpha_op`), `set_blending`, `set_mag_filter`, `set_image_data`, `set_tlut_data`, `set_next`, `tex_gen_src` (property — `GXTexGenSrc` u32 at 0x0C), `set_flag_bit(mask, on)`, `set_lightmap_{diffuse,specular,ambient,ext,shadow}` / `set_bump` (bit-RMW; preserves coord/color/alpha nibbles) |
+| `TObj` | `alloc`, `set_tex_map_id`, `set_rotation` / `set_scale` / `set_translation`, `set_wrap_s` / `_t`, `set_repeat_*`, `set_flags` + nibble setters (`coord_type` / `color_op` / `alpha_op`), `set_blending`, `set_mag_filter`, `set_image_data`, `set_tlut_data`, `set_next`, `tex_gen_src` (property — `GXTexGenSrc` u32 at 0x0C), `set_flag_bit(mask, on)`, `set_lightmap_{diffuse,specular,ambient,ext,shadow}` / `set_bump` (bit-RMW; preserves coord/color/alpha nibbles), `lod_data` (property → `Lod`), `set_lod_data`, `set_lod(min_filter, bias, bias_clamp, enable_edge_lod, anisotropy)` (one-shot Lod alloc + attach), `to_dict()` |
+| `Lod` | `alloc`, `min_filter` / `bias` / `bias_clamp` / `enable_edge_lod` / `anisotropy` (all properties), `to_dict()` — wraps `HSD_TOBJ_LOD` (0x10 bytes); attach to a TObj via `set_lod_data` |
 | `Image` | `alloc`, `set_image_data_bytes`, `set_width` / `_height`, `set_format`, `set_mipmap`, `set_min_lod` / `_max_lod` |
 | `HsdStruct` | `byte_size`, `raw`, `references`, `get_reference`, `set_reference`, `set_u8` / `set_u16` / `set_u32` / `set_bytes` (byte-level patch primitives) |
 

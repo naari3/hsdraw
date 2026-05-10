@@ -20,20 +20,20 @@ use std::rc::Rc;
 use hsdraw_core::accessor::Accessor;
 use hsdraw_core::common::{
     DObj as CoreDObj, Image as CoreImage, JObj as CoreJObj, JObjDesc as CoreJObjDesc,
-    MObj as CoreMObj, Material as CoreMaterial, PObj as CorePObj, PeDesc as CorePeDesc,
-    SObj as CoreSObj, TObj as CoreTObj,
+    Lod as CoreLod, MObj as CoreMObj, Material as CoreMaterial, PObj as CorePObj,
+    PeDesc as CorePeDesc, SObj as CoreSObj, TObj as CoreTObj,
 };
 use hsdraw_core::dat::RootNode;
 use hsdraw_core::gx::{
-    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexGenSrc, GxTexMapId, GxTlutFmt,
-    GxWrapMode, JObjFlag, MaterialRenderMode, TObjFlags,
+    AlphaMap, ColorMap, CoordType, GxAnisotropy, GxTexFilter, GxTexFmt, GxTexGenSrc, GxTexMapId,
+    GxTlutFmt, GxWrapMode, JObjFlag, MaterialRenderMode, TObjFlags,
 };
 use hsdraw_core::hsd_struct::{StructRef, ptr_eq};
 use hsdraw_core::pobj_writer::MeshBuilder as CoreMeshBuilder;
 use hsdraw_core::{export, Dat as CoreDat};
 use pyo3::exceptions::{PyDeprecationWarning, PyIOError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 
 #[pyfunction]
 fn version() -> &'static str {
@@ -503,6 +503,48 @@ impl PyJObj {
         Ok(())
     }
 
+    /// Decoded snapshot of every JObj field as a Python dict.  Mirrors
+    /// the HSDLib `HSD_JOBJ` accessor: raw `flags`, presence flags for
+    /// child / next / dobj refs, and the local TRS triple.  `addr` is
+    /// the underlying struct's Rc pointer cast to int (= identity).
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let v = self.view();
+        let d = PyDict::new(py);
+        d.set_item("addr", Rc::as_ptr(&self.inner) as usize)?;
+        d.set_item("flags", v.flags().map_err(map_err)?.bits())?;
+        d.set_item("child_present", v.child().is_some())?;
+        d.set_item("next_present", v.next().is_some())?;
+        d.set_item(
+            "dobj_present",
+            v.dobj().map_err(map_err)?.is_some(),
+        )?;
+        d.set_item(
+            "rotation",
+            (
+                v.rx().map_err(map_err)?,
+                v.ry().map_err(map_err)?,
+                v.rz().map_err(map_err)?,
+            ),
+        )?;
+        d.set_item(
+            "scale",
+            (
+                v.sx().map_err(map_err)?,
+                v.sy().map_err(map_err)?,
+                v.sz().map_err(map_err)?,
+            ),
+        )?;
+        d.set_item(
+            "translation",
+            (
+                v.tx().map_err(map_err)?,
+                v.ty().map_err(map_err)?,
+                v.tz().map_err(map_err)?,
+            ),
+        )?;
+        Ok(d)
+    }
+
     // ----- Identity ---------------------------------------------------
     fn __eq__(&self, other: &Self) -> bool {
         ptr_eq(&self.inner, &other.inner)
@@ -685,6 +727,36 @@ impl PyPObj {
         Ok(self.inner.borrow().get_i16(0x0E).map_err(map_err)? as u32 * 32)
     }
 
+    /// Decoded snapshot of every POBJ field as a Python dict.  Mirrors
+    /// HSDLib's `HSD_POBJ`: raw `flags` (u16), computed
+    /// `display_list_size` (bytes), and presence flags for the four
+    /// child slots (`next` 0x04, `attributes_struct` 0x08,
+    /// `display_list_buffer` 0x10, `single_bound_jobj` 0x14).
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let v = CorePObj::from_struct(self.inner.clone());
+        let d = PyDict::new(py);
+        d.set_item("addr", Rc::as_ptr(&self.inner) as usize)?;
+        d.set_item("flags", v.flags().map_err(map_err)?.bits())?;
+        d.set_item(
+            "display_list_size",
+            v.display_list_size().map_err(map_err)?,
+        )?;
+        d.set_item("next_present", v.next().is_some())?;
+        d.set_item(
+            "attributes_struct_present",
+            v.attributes_struct().is_some(),
+        )?;
+        d.set_item(
+            "display_list_buffer_present",
+            v.display_list_buffer().is_some(),
+        )?;
+        d.set_item(
+            "single_bound_jobj_present",
+            v.single_bound_jobj().map_err(map_err)?.is_some(),
+        )?;
+        Ok(d)
+    }
+
     fn __eq__(&self, other: &Self) -> bool {
         ptr_eq(&self.inner, &other.inner)
     }
@@ -811,6 +883,24 @@ impl PyMObj {
         };
         self.inner.borrow_mut().set_reference(0x08, target);
         Ok(())
+    }
+
+    /// Decoded snapshot of every MObj field as a Python dict.  Carries
+    /// the raw `render_flags` (HSDLib `RENDER_MODE` bits) plus presence
+    /// flags for the three child refs (`material` 0x0C, `textures` 0x08
+    /// / TObj chain head, `pe_desc` 0x14).  Identity is `addr` (Rc ptr).
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let v = CoreMObj::from_struct(self.inner.clone());
+        let d = PyDict::new(py);
+        d.set_item("addr", Rc::as_ptr(&self.inner) as usize)?;
+        d.set_item(
+            "render_flags",
+            v.render_flags().map_err(map_err)?.bits(),
+        )?;
+        d.set_item("material_present", v.material().is_some())?;
+        d.set_item("textures_present", v.textures().is_some())?;
+        d.set_item("pe_desc_present", v.pe_desc().is_some())?;
+        Ok(d)
     }
 
     fn __eq__(&self, other: &Self) -> bool {
@@ -1082,6 +1172,23 @@ impl PySObj {
             .collect();
         let arr = hsdraw_core::common::build_jobj_descs_array(&core);
         CoreSObj::from_struct(self.inner.clone()).set_jobj_descs_array(Some(arr));
+    }
+
+    /// Decoded snapshot of every SObj field as a Python dict.  Reports
+    /// the count of `JOBJDescs[]` entries (HSDLib's
+    /// `HSDNullPointerArrayAccessor` walk) plus a presence flag for the
+    /// underlying array struct.  Camera / light / fog slots aren't
+    /// surfaced here (this binding doesn't expose them yet).
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let v = CoreSObj::from_struct(self.inner.clone());
+        let d = PyDict::new(py);
+        d.set_item("addr", Rc::as_ptr(&self.inner) as usize)?;
+        d.set_item("jobj_descs_count", v.jobj_descs().len())?;
+        d.set_item(
+            "jobj_descs_array_present",
+            v.jobj_descs_array().is_some(),
+        )?;
+        Ok(d)
     }
 
     fn __eq__(&self, other: &Self) -> bool {
@@ -1514,6 +1621,139 @@ impl PyTObj {
         s.set_reference(0x50, tlut.map(|t| t.inner.clone()));
     }
 
+    /// Attached `Lod` (HSD_TOBJ_LOD) struct, or `None`.  When NULL,
+    /// GX hardware applies global default min_filter / lod_bias /
+    /// aniso — see [`PyLod`] for the effect of an explicit attachment.
+    #[getter]
+    fn lod_data(&self) -> Option<PyLod> {
+        CoreTObj::from_struct(self.inner.clone())
+            .lod_data()
+            .map(|l| PyLod { inner: l.0 })
+    }
+
+    /// Attach (or detach) the `Lod` reference at offset 0x54.  Pass
+    /// `None` to detach.
+    #[pyo3(signature = (lod=None))]
+    fn set_lod_data(&self, lod: Option<&PyLod>) {
+        CoreTObj::from_struct(self.inner.clone()).set_lod_data(
+            lod.map(|l| CoreLod::from_struct(l.inner.clone())),
+        );
+    }
+
+    /// Convenience: build a fresh `Lod` with the supplied fields and
+    /// attach it.  Mirrors the HSDLib `HSD_TOBJ_LOD { … }` initializer
+    /// pattern in one call — useful when you just want a non-NULL LOD
+    /// with deterministic min_filter / aniso to overwrite the GX
+    /// hardware default sampler behaviour.  Field defaults (when
+    /// omitted) follow `Lod.alloc()`: `min_filter=GX_NEAR (0)`,
+    /// `bias=0.0`, `bias_clamp=False`, `enable_edge_lod=False`,
+    /// `anisotropy=GX_ANISO_1 (0)`.  All ints are raw GX enum values
+    /// (see HSDLib `GXTexFilter` / `GXAnisotropy`).
+    #[pyo3(signature = (
+        min_filter = 0,
+        bias = 0.0,
+        bias_clamp = false,
+        enable_edge_lod = false,
+        anisotropy = 0,
+    ))]
+    fn set_lod(
+        &self,
+        min_filter: u32,
+        bias: f32,
+        bias_clamp: bool,
+        enable_edge_lod: bool,
+        anisotropy: u32,
+    ) -> PyResult<()> {
+        let lod = CoreLod::allocate_default();
+        lod.set_min_filter(GxTexFilter::from(min_filter))
+            .map_err(map_err)?;
+        lod.set_bias(bias).map_err(map_err)?;
+        lod.set_bias_clamp(bias_clamp).map_err(map_err)?;
+        lod.set_enable_edge_lod(enable_edge_lod).map_err(map_err)?;
+        lod.set_anisotropy(GxAnisotropy::from(anisotropy))
+            .map_err(map_err)?;
+        CoreTObj::from_struct(self.inner.clone()).set_lod_data(Some(lod));
+        Ok(())
+    }
+
+    /// Decoded snapshot of every TObj field as a Python dict.  Mirrors
+    /// the HSDLib `HSD_TOBJ` accessor surface: raw flags + decoded
+    /// nibbles (`coord_type` / `color_op` / `alpha_op`), per-bit
+    /// lightmap booleans, plus presence booleans for the 4 child refs
+    /// (image / tlut / lod / tev).  Identity is reported as `addr`
+    /// (the underlying struct's Rc pointer cast to int).  Numeric
+    /// fields use raw GX enum integers — the Python caller decodes
+    /// against HSDLib's own enum definitions.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let v = CoreTObj::from_struct(self.inner.clone());
+        let d = PyDict::new(py);
+        d.set_item("addr", Rc::as_ptr(&self.inner) as usize)?;
+        d.set_item("next_present", v.next().is_some())?;
+        d.set_item("tex_map_id", u32::from(v.tex_map_id().map_err(map_err)?))?;
+        d.set_item(
+            "tex_gen_src",
+            u32::from(v.tex_gen_src().map_err(map_err)?),
+        )?;
+        d.set_item(
+            "rotation",
+            (
+                v.rx().map_err(map_err)?,
+                v.ry().map_err(map_err)?,
+                v.rz().map_err(map_err)?,
+            ),
+        )?;
+        d.set_item(
+            "scale",
+            (
+                v.sx().map_err(map_err)?,
+                v.sy().map_err(map_err)?,
+                v.sz().map_err(map_err)?,
+            ),
+        )?;
+        d.set_item(
+            "translation",
+            (
+                v.tx().map_err(map_err)?,
+                v.ty().map_err(map_err)?,
+                v.tz().map_err(map_err)?,
+            ),
+        )?;
+        d.set_item("wrap_s", u32::from(v.wrap_s().map_err(map_err)?))?;
+        d.set_item("wrap_t", u32::from(v.wrap_t().map_err(map_err)?))?;
+        d.set_item("repeat_s", v.repeat_s().map_err(map_err)?)?;
+        d.set_item("repeat_t", v.repeat_t().map_err(map_err)?)?;
+        let flags = v.flags().map_err(map_err)?;
+        d.set_item("flags", flags.bits())?;
+        d.set_item(
+            "coord_type",
+            u32::from(v.coord_type().map_err(map_err)?),
+        )?;
+        d.set_item(
+            "color_op",
+            u32::from(v.color_operation().map_err(map_err)?),
+        )?;
+        d.set_item(
+            "alpha_op",
+            u32::from(v.alpha_operation().map_err(map_err)?),
+        )?;
+        d.set_item("is_lightmap_diffuse", v.is_lightmap_diffuse().map_err(map_err)?)?;
+        d.set_item("is_lightmap_specular", v.is_lightmap_specular().map_err(map_err)?)?;
+        d.set_item("is_lightmap_ambient", v.is_lightmap_ambient().map_err(map_err)?)?;
+        d.set_item("is_lightmap_ext", v.is_lightmap_ext().map_err(map_err)?)?;
+        d.set_item("is_lightmap_shadow", v.is_lightmap_shadow().map_err(map_err)?)?;
+        d.set_item("is_bump", v.is_bump().map_err(map_err)?)?;
+        d.set_item("blending", v.blending().map_err(map_err)?)?;
+        d.set_item(
+            "mag_filter",
+            u32::from(v.mag_filter().map_err(map_err)?),
+        )?;
+        d.set_item("image_data_present", v.image_data().is_some())?;
+        d.set_item("tlut_data_present", v.tlut_data().is_some())?;
+        d.set_item("lod_data_present", v.lod_data().is_some())?;
+        d.set_item("tev_data_present", v.tev_data().is_some())?;
+        Ok(d)
+    }
+
     fn __eq__(&self, other: &Self) -> bool {
         ptr_eq(&self.inner, &other.inner)
     }
@@ -1525,6 +1765,159 @@ impl PyTObj {
     fn __repr__(&self) -> String {
         format!(
             "<hsdraw.TObj addr=0x{:X}>",
+            Rc::as_ptr(&self.inner) as usize
+        )
+    }
+}
+
+// =====================================================================
+// Lod typed view  (HSDLib HSD_TOBJ_LOD accessor)
+// =====================================================================
+
+/// Typed view onto a 0x10-byte HSD_TOBJ_LOD struct.  Per-TObj
+/// min-filter / LOD-bias / anisotropy settings.  When a TObj has no
+/// LOD attached, GX hardware uses the global default sampler — for
+/// textures expecting an explicit LOD this can produce a footprint-
+/// averaging look on minified texels.  Construct via `Lod.alloc()`,
+/// configure with the per-field setters, and attach via
+/// `TObj.set_lod_data(lod)` (or build + attach in one step using the
+/// `TObj.set_lod(...)` convenience).
+///
+/// All enum-valued fields use the raw GX enum integer (not a Python
+/// enum class); see HSDLib `GXTexFilter` and `GXAnisotropy` for the
+/// numeric mapping.
+#[pyclass(name = "Lod", module = "hsdraw", unsendable)]
+struct PyLod {
+    inner: StructRef,
+}
+
+#[pymethods]
+impl PyLod {
+    /// Allocate a fresh 0x10-byte HSD_TOBJ_LOD.  All fields zero —
+    /// `min_filter = GX_NEAR (0)`, `bias = 0.0`,
+    /// `bias_clamp = False`, `enable_edge_lod = False`,
+    /// `anisotropy = GX_ANISO_1 (0)`.
+    #[staticmethod]
+    fn alloc() -> Self {
+        Self { inner: CoreLod::allocate_default().0 }
+    }
+
+    #[staticmethod]
+    fn from_struct(s: &PyHsdStruct) -> Self {
+        Self { inner: s.inner.clone() }
+    }
+
+    fn as_struct(&self) -> PyHsdStruct {
+        PyHsdStruct { inner: self.inner.clone() }
+    }
+
+    #[getter]
+    fn min_filter(&self) -> PyResult<u32> {
+        CoreLod::from_struct(self.inner.clone())
+            .min_filter()
+            .map(u32::from)
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_min_filter(&self, v: u32) -> PyResult<()> {
+        CoreLod::from_struct(self.inner.clone())
+            .set_min_filter(GxTexFilter::from(v))
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn bias(&self) -> PyResult<f32> {
+        CoreLod::from_struct(self.inner.clone())
+            .bias()
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_bias(&self, v: f32) -> PyResult<()> {
+        CoreLod::from_struct(self.inner.clone())
+            .set_bias(v)
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn bias_clamp(&self) -> PyResult<bool> {
+        CoreLod::from_struct(self.inner.clone())
+            .bias_clamp()
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_bias_clamp(&self, v: bool) -> PyResult<()> {
+        CoreLod::from_struct(self.inner.clone())
+            .set_bias_clamp(v)
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn enable_edge_lod(&self) -> PyResult<bool> {
+        CoreLod::from_struct(self.inner.clone())
+            .enable_edge_lod()
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_enable_edge_lod(&self, v: bool) -> PyResult<()> {
+        CoreLod::from_struct(self.inner.clone())
+            .set_enable_edge_lod(v)
+            .map_err(map_err)
+    }
+
+    #[getter]
+    fn anisotropy(&self) -> PyResult<u32> {
+        CoreLod::from_struct(self.inner.clone())
+            .anisotropy()
+            .map(u32::from)
+            .map_err(map_err)
+    }
+
+    #[setter]
+    fn set_anisotropy(&self, v: u32) -> PyResult<()> {
+        CoreLod::from_struct(self.inner.clone())
+            .set_anisotropy(GxAnisotropy::from(v))
+            .map_err(map_err)
+    }
+
+    /// Decoded snapshot of every Lod field as a Python dict.  Mirrors
+    /// the HSD_TOBJ_LOD layout (TrimmedSize 0x10): all five fields plus
+    /// `addr` (Rc identity).  Numeric fields are raw GX enum integers.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let v = CoreLod::from_struct(self.inner.clone());
+        let d = PyDict::new(py);
+        d.set_item("addr", Rc::as_ptr(&self.inner) as usize)?;
+        d.set_item(
+            "min_filter",
+            u32::from(v.min_filter().map_err(map_err)?),
+        )?;
+        d.set_item("bias", v.bias().map_err(map_err)?)?;
+        d.set_item("bias_clamp", v.bias_clamp().map_err(map_err)?)?;
+        d.set_item(
+            "enable_edge_lod",
+            v.enable_edge_lod().map_err(map_err)?,
+        )?;
+        d.set_item(
+            "anisotropy",
+            u32::from(v.anisotropy().map_err(map_err)?),
+        )?;
+        Ok(d)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn __hash__(&self) -> isize {
+        Rc::as_ptr(&self.inner) as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hsdraw.Lod addr=0x{:X}>",
             Rc::as_ptr(&self.inner) as usize
         )
     }
@@ -2034,6 +2427,7 @@ fn hsdraw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySObj>()?;
     m.add_class::<PyJObjDesc>()?;
     m.add_class::<PyTObj>()?;
+    m.add_class::<PyLod>()?;
     m.add_class::<PyImage>()?;
     m.add_class::<PyMeshBuilder>()?;
     Ok(())

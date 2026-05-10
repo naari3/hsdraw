@@ -63,6 +63,9 @@ straight into Python without bringing project-specific schemas (e.g.
 | `TObj.set_flag_bit(mask, on)` | (none — bit-RMW helper) | preserves coord/color/alpha nibbles |
 | `TObj.set_lightmap_{diffuse,specular,ambient,ext,shadow}(b)` / `.set_bump(b)` | `tobj.Flags |= LIGHTMAP_*` / `BUMP` | named flag setters (RMW) |
 | `TObj.is_lightmap_{diffuse,specular,ambient,ext,shadow}()` / `.is_bump()` | `(tobj.Flags & LIGHTMAP_*) != 0` | named flag getters |
+| `TObj.lod_data` (property) / `.set_lod_data(lod or None)` / `.set_lod(min_filter=…, bias=…, bias_clamp=…, enable_edge_lod=…, anisotropy=…)` | `tobj.LOD = HSD_TOBJ_LOD { … }` | LOD struct attach (set_lod は alloc + attach 一括) |
+| `Lod.alloc()` + `.{min_filter,bias,bias_clamp,enable_edge_lod,anisotropy}` | `new HSD_TOBJ_LOD { MinFilter=…, Bias=…, BiasClamp=…, EnableEdgeLOD=…, Anisotropy=… }` | HSD_TOBJ_LOD wrapper (size 0x10) |
+| `TObj.to_dict()` / `MObj.to_dict()` / `Pobj.to_dict()` / `JObj.to_dict()` / `SObj.to_dict()` / `Lod.to_dict()` | (none — diagnostic helper) | フィールド全スナップショットを Python dict で返す (debug 時の手 parse 不要) |
 | `Image.alloc()` + `.set_image_data_bytes(b)` | `new HSD_Image { ImageData = HSDStruct(b) }`         | image alloc + payload |
 | `Image.{width,height,format,mipmap,min_lod,max_lod}` | `img.Width` / `.Height` / `.Format` / `.MipMap` / `.LODBias` / `.MaxLOD` | per-field setters |
 | `hsdraw.gx_encode(format, w, h, rgba, swap_rb_for_rgb5a3=False) -> bytes` | `GXImageConverter.EncodeImage(GX_TF_*, w, h, rgba)` | RGBA8 → GX bytes encoder (RGBA8 / RGB565 / RGB5A3 / CMP only); `swap_rb_for_rgb5a3=True` で RGB5A3 のみ R/B を事前スワップ (BGR-order sampler 向け) |
@@ -376,6 +379,22 @@ s = tobj.as_struct()
 s.set_u32(0x0C, 4)                          # GX_TG_TEX0 in raw bytes
 s.set_u8(0x40, s.raw()[0x40] | 0x10)        # LIGHTMAP_DIFFUSE bit on
 s.set_bytes(0x20, b"\x00" * 4)              # blank 4 bytes at 0x20
+
+# (5) HSD_TOBJ_LOD attach — overrides default GX hardware sampler.
+#     Useful when the default min_filter / aniso behaviour produces
+#     unexpected texture-footprint averaging.  Use raw GX enum ints:
+#       min_filter: 0=GX_NEAR  1=GX_LINEAR  2..5=mipmap variants
+#       anisotropy: 0=GX_ANISO_1  1=GX_ANISO_2  2=GX_ANISO_4  3=GX_MAX
+tobj.set_lod(min_filter=0, bias=0.0, bias_clamp=False,
+             enable_edge_lod=False, anisotropy=0)
+assert tobj.lod_data.min_filter == 0
+
+# (6) to_dict() — debug-style snapshot of every typed-view field.
+#     Avoids hand-parsing raw bytes against HSDLib offsets.
+print(tobj.to_dict())
+print(pobj.to_dict())   # raw flags, display_list_size, child presence
+print(mobj.to_dict())   # render_flags, material/textures/pe_desc presence
+print(jobj.to_dict())   # flags, child/next/dobj presence, TRS triples
 ```
 
 ## Limitations (deliberate non-goals)

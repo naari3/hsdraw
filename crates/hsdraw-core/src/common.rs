@@ -6,8 +6,8 @@
 use crate::accessor::{Accessor, accessor};
 use crate::error::Result;
 use crate::gx::{
-    AlphaMap, ColorMap, CoordType, GxTexFilter, GxTexFmt, GxTexGenSrc, GxTexMapId, GxTlutFmt,
-    GxWrapMode, JObjFlag, MaterialRenderMode, PObjFlag, TObjFlags,
+    AlphaMap, ColorMap, CoordType, GxAnisotropy, GxTexFilter, GxTexFmt, GxTexGenSrc, GxTexMapId,
+    GxTlutFmt, GxWrapMode, JObjFlag, MaterialRenderMode, PObjFlag, TObjFlags,
 };
 use crate::hsd_struct::{HsdStruct, StructRef};
 
@@ -455,6 +455,22 @@ impl TObj {
     }
     pub fn image_data(&self) -> Option<Image> { self.ref_at::<Image>(0x4C) }
     pub fn tlut_data(&self) -> Option<Tlut> { self.ref_at::<Tlut>(0x50) }
+    /// `LOD` reference at offset 0x54 (HSDLib `HSD_TOBJ.LOD` →
+    /// `HSD_TOBJ_LOD`).  Carries the per-TObj min-filter / LOD-bias /
+    /// anisotropy settings.  When NULL, GX hardware applies the global
+    /// defaults (min_filter = `GX_NEAR`, bias = 0, aniso = 1× — which
+    /// can be a footprint-averaging surprise on textures with no LOD
+    /// specified).  See [`Lod`] for the field accessors.
+    pub fn lod_data(&self) -> Option<Lod> { self.ref_at::<Lod>(0x54) }
+    /// `TEV` reference at offset 0x58 (HSDLib `HSD_TOBJ.TEV` →
+    /// `HSD_TOBJ_TEV`).  Returned as a raw `StructRef` for now — the
+    /// TEV struct has 28 bytes of register data that no public consumer
+    /// is decoding yet.  Use [`crate::hsd_struct::HsdStruct::set_u8`]
+    /// etc. on the returned struct to poke individual fields, or
+    /// `get_reference(0x58)` directly.
+    pub fn tev_data(&self) -> Option<StructRef> {
+        self.s().get_reference(0x58)
+    }
 
     // ----- mutators ------------------------------------------------
     /// Allocate a fresh HSD_TOBJ: 0x5C bytes, all-zero fields (no
@@ -675,6 +691,20 @@ impl TObj {
             .set_reference(0x50, tlut.map(|t| t.0));
     }
 
+    /// Attach (or detach) the `Lod` reference at offset 0x54.  HSDLib:
+    /// `tobj.LOD = HSD_TOBJ_LOD`.  When NULL, GX hardware picks the
+    /// global default min_filter / lod_bias / aniso — for textures
+    /// that don't ship with a LOD struct, the runtime defaults can
+    /// produce a footprint-averaging look on minified texels.  Set
+    /// an explicit Lod with `Lod::allocate_default` + per-field
+    /// setters when that matters.
+    pub fn set_lod_data(&self, lod: Option<Lod>) {
+        self.ensure_tobj_size();
+        self.0
+            .borrow_mut()
+            .set_reference(0x54, lod.map(|l| l.0));
+    }
+
     fn ensure_tobj_size(&self) {
         let mut s = self.0.borrow_mut();
         if s.len() < 0x5C {
@@ -797,6 +827,84 @@ impl Tlut {
     }
     pub fn gx_tlut(&self) -> Result<i32> { self.s().get_i32(0x08) }
     pub fn color_count(&self) -> Result<i16> { self.s().get_i16(0x0C) }
+}
+
+// =====================================================================
+// Lod  (HSDRaw/Common/HSD_TOBJ.cs:389 `HSD_TOBJ_LOD`, TrimmedSize 0x10)
+// =====================================================================
+//
+// Per-TObj min-filter / LOD-bias / anisotropy settings.  Layout (BE):
+//   0x00 i32 MinFilter         (`GXTexFilter` enum)
+//   0x04 f32 Bias              (mip LOD bias)
+//   0x08 u8  BiasClamp         (bool)
+//   0x09 u8  EnableEdgeLOD     (bool)
+//   0x0A i32 Anisotropy        (`GXAnisotropy`; **byte-unaligned!** —
+//                               HSDLib uses `_s.GetInt32(0x0A)` so the
+//                               i32 occupies bytes 0x0A..=0x0D)
+//   0x0E .. 0x0F  padding to TrimmedSize 0x10
+
+accessor!(Lod);
+
+impl Lod {
+    pub fn min_filter(&self) -> Result<GxTexFilter> {
+        Ok(GxTexFilter::from(self.s().get_u32(0x00)?))
+    }
+    pub fn bias(&self) -> Result<f32> { self.s().get_f32(0x04) }
+    pub fn bias_clamp(&self) -> Result<bool> {
+        Ok(self.s().get_byte(0x08)? == 1)
+    }
+    pub fn enable_edge_lod(&self) -> Result<bool> {
+        Ok(self.s().get_byte(0x09)? == 1)
+    }
+    /// `Anisotropy` at the (byte-unaligned) i32 offset 0x0A.  Mirrors
+    /// HSDLib's `_s.GetInt32(0x0A)` — bytes 0x0A..=0x0D form the BE i32.
+    pub fn anisotropy(&self) -> Result<GxAnisotropy> {
+        Ok(GxAnisotropy::from(self.s().get_u32(0x0A)?))
+    }
+
+    // ----- mutators ------------------------------------------------
+    /// Allocate a fresh HSD_TOBJ_LOD (0x10 bytes, all-zero — i.e.
+    /// `MinFilter = GX_NEAR`, `Bias = 0`, `BiasClamp = false`,
+    /// `EnableEdgeLOD = false`, `Anisotropy = GX_ANISO_1`).  Pair with
+    /// the per-field setters below; attach to a TObj via
+    /// [`TObj::set_lod_data`].
+    pub fn allocate_default() -> Self {
+        Lod::from_struct(HsdStruct::with_capacity(0x10).into_ref())
+    }
+
+    pub fn set_min_filter(&self, f: GxTexFilter) -> Result<()> {
+        self.ensure_lod_size();
+        self.0.borrow_mut().set_u32(0x00, u32::from(f))
+    }
+
+    pub fn set_bias(&self, v: f32) -> Result<()> {
+        self.ensure_lod_size();
+        self.0.borrow_mut().set_f32(0x04, v)
+    }
+
+    pub fn set_bias_clamp(&self, on: bool) -> Result<()> {
+        self.ensure_lod_size();
+        self.0.borrow_mut().set_u8(0x08, if on { 1 } else { 0 })
+    }
+
+    pub fn set_enable_edge_lod(&self, on: bool) -> Result<()> {
+        self.ensure_lod_size();
+        self.0.borrow_mut().set_u8(0x09, if on { 1 } else { 0 })
+    }
+
+    /// Set `Anisotropy` at the byte-unaligned i32 offset 0x0A.  Mirrors
+    /// HSDLib `_s.SetInt32(0x0A, …)` — writes bytes 0x0A..=0x0D BE.
+    pub fn set_anisotropy(&self, a: GxAnisotropy) -> Result<()> {
+        self.ensure_lod_size();
+        self.0.borrow_mut().set_u32(0x0A, u32::from(a))
+    }
+
+    fn ensure_lod_size(&self) {
+        let mut s = self.0.borrow_mut();
+        if s.len() < 0x10 {
+            s.resize(0x10);
+        }
+    }
 }
 
 // =====================================================================
